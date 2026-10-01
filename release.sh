@@ -2,11 +2,17 @@
 # Build a release: universal (Apple Silicon + Intel) app with an installer, written to
 # updates/NetworkScanner.zip + updates/latest.json. Committing and pushing updates/ ships it:
 # every installed copy's "Check for Updates" reads latest.json from this repo on GitHub.
-#   1. bump CFBundleShortVersionString in Info.plist
-#   2. UPDATE_NOTES="What changed" ./release.sh
+#
+# Usually you don't run this yourself: bump CFBundleShortVersionString in Info.plist, write the
+# notes in RELEASE_NOTES.txt, and merge to main. .github/workflows/release.yml then runs this on
+# a Mac and commits updates/. To ship by hand instead: UPDATE_NOTES="What changed" ./release.sh
+# (without UPDATE_NOTES the notes come from RELEASE_NOTES.txt).
 set -e
 cd "$(dirname "$0")"
 VERSION=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' Info.plist)
+if [[ -z "${UPDATE_NOTES:-}" && -f RELEASE_NOTES.txt ]]; then
+  UPDATE_NOTES=$(<RELEASE_NOTES.txt)
+fi
 BUILD=$(git rev-list --count HEAD 2>/dev/null || echo 0)
 CACHE="${TMPDIR:-/tmp}/networkscanner-modcache"
 SOURCES=(NetworkScanner.swift Scanner.swift Identify.swift Updater.swift)
