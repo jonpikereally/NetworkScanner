@@ -787,7 +787,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(.separator())
         let makers = item("Look Up Device Makers", #selector(toggleMakers))
         makers.state = VendorDB.shared.enabled ? .on : .off
-        makers.toolTip = "Downloads the public MAC address maker list from wireshark.org about once a month."
+        makers.toolTip = "Downloads the public IEEE MAC address maker list (via the Nmap project on GitHub) about once a month."
         menu.addItem(makers)
         menu.addItem(item("Forget Remembered Devices\u{2026}", #selector(forgetDevices)))
     }

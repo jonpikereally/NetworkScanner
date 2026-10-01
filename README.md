@@ -19,7 +19,7 @@ A small Mac app that shows what's on your local network: every device's icon, IP
 1. **TCP probes**: a non-blocking connect to ~25 common ports (SSH, HTTP/S, SMB, AirPlay, Cast, IPP, Sonos, Plex, the iPhone sync port…) on every address in the subnet, 48 hosts at a time. Any answer, even a refusal, means something is there. Networks larger than /22 are cut down to the /24 around the Mac.
 2. **ARP cache**: the probes make macOS ARP every address, so `arp -an` afterwards lists devices that ignore TCP entirely (most phones, smart plugs) along with their MAC addresses.
 3. **Names**: Bonjour browsing (AirPlay, Chromecast, HomeKit, printers, file sharing and ~25 other types) gives friendly names like "Living Room" and models like `AppleTV14,1`; reverse DNS fills in the rest.
-4. **Makers**: the first half of the MAC address, looked up in Wireshark's copy of the IEEE OUI list. Phones and laptops using a *private Wi-Fi address* show "Private address" instead, since those MACs are random.
+4. **Makers**: what the device says about itself over UPnP, otherwise the first half of the MAC address looked up in the IEEE registry (as published by the Nmap project, with Wireshark's copy as a fallback). Phones and laptops using a *private Wi-Fi address* have random MACs, so their maker comes from Apple-only signals ("Apple") or shows "Private address".
 5. **Identify pass**, after each scan:
    - **UPnP**: one multicast search; TVs, routers, Sonos, consoles, NAS and smart hubs answer with a description giving their friendly name, manufacturer, model and often firmware.
    - **Bonjour details**: printer model and location, HomeKit category (light, plug, thermostat…), Chromecast model and what's playing, AirPlay model and OS version.
@@ -72,4 +72,4 @@ The Network Scanner menu shows the version, build number and build time, e.g. *V
 
 ## Privacy
 
-Scans stay on your network: the identify pass only talks to addresses on your local network. The only things fetched from the internet are `updates/latest.json` from this repo, and (unless you turn off **Look Up Device Makers**) the public maker list from wireshark.org, about once a month, cached in `~/Library/Application Support/NetworkScanner/`.
+Scans stay on your network: the identify pass only talks to addresses on your local network. The only things fetched from the internet are `updates/latest.json` from this repo, and (unless you turn off **Look Up Device Makers**) the public IEEE maker list (from the Nmap project on raw.githubusercontent.com, or wireshark.org as a fallback), about once a month, cached in `~/Library/Application Support/NetworkScanner/`.
