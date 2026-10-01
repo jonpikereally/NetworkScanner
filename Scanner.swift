@@ -333,12 +333,71 @@ struct BonjourHost {
     var types: Set<String> = []
     var model: String?
     var category: String?
+    var hostname: String?        // "Jons-iPad.local", from mDNS
     var facts: [Fact] = []
 
     mutating func add(_ label: String, _ value: String?) {
         guard let v = Net.clean(value) else { return }
         let f = Fact(source: "Bonjour", label: label, value: v)
         if !facts.contains(f) { facts.append(f) }
+    }
+
+    /// Learns from one advertised service: its type ("_airplay._tcp"), instance name and TXT record.
+    /// Shared by the NetService browser and the direct mDNS queries in Identify.swift.
+    mutating func ingest(type: String, instance: String, txt: [String: String]) {
+        func t(_ key: String) -> String? { txt[key].flatMap { $0.isEmpty ? nil : $0 } }
+        types.insert(type)
+        if type.hasPrefix("_device-info") {
+            if let m = t("model") { model = model ?? m; add("Model", m) }
+            return
+        }
+        var name = instance
+        if type.hasPrefix("_raop"), let at = name.firstIndex(of: "@") { name = String(name[name.index(after: at)...]) }
+        if type.hasPrefix("_googlecast"), let fn = t("fn") { name = fn }
+        if type.hasPrefix("_sleep-proxy"), let sp = name.firstIndex(of: " ") { name = String(name[name.index(after: sp)...]) }
+        let priority = BonjourBrowser.types.firstIndex { type.hasPrefix($0) } ?? BonjourBrowser.types.count
+        if priority < namePriority, !Self.looksLikeID(name) { self.name = name; namePriority = priority }
+
+        let isPrinter = ["_ipp", "_ipps", "_printer", "_pdl-datastream"].contains { type.hasPrefix($0) }
+        let m = isPrinter ? (t("ty") ?? t("product").map { $0.trimmingCharacters(in: CharacterSet(charactersIn: "()")) })
+            : type.hasPrefix("_raop") ? t("am")
+            : type.hasPrefix("_companion-link") ? t("rpMd")
+            : t("model") ?? t("md")
+        if model == nil { model = m }
+        add("Model", m)
+        if isPrinter {
+            category = "Printer"
+            add("Printer location", t("note"))
+            add("Admin page", t("adminurl"))
+        }
+        if type.hasPrefix("_hap"), let ci = t("ci").flatMap({ Int($0) }), let c = homeKitCategories[ci] {
+            category = c
+            add("HomeKit category", c)
+        }
+        if type.hasPrefix("_googlecast") {
+            add("Cast name", t("fn"))
+            add("Now playing", t("rs"))
+        }
+        if type.hasPrefix("_airplay") {
+            add("OS version", t("osvers"))
+            add("AirPlay version", t("srcvers"))
+        }
+    }
+
+    /// Combines what two sources learned about the same address.
+    mutating func merge(_ o: BonjourHost) {
+        if o.namePriority < namePriority, let n = o.name { name = n; namePriority = o.namePriority }
+        types.formUnion(o.types)
+        model = model ?? o.model
+        category = category ?? o.category
+        hostname = hostname ?? o.hostname
+        for f in o.facts where !facts.contains(f) { facts.append(f) }
+    }
+
+    /// Service names that are serial numbers or UUIDs rather than something a person chose.
+    static func looksLikeID(_ s: String) -> Bool {
+        let hex = s.filter { $0.isHexDigit }.count
+        return s.count >= 12 && hex >= s.count - s.filter { $0 == "-" || $0 == ":" }.count
     }
 }
 
@@ -413,48 +472,18 @@ final class BonjourBrowser: NSObject, NetServiceBrowserDelegate, NetServiceDeleg
 
     private func record(_ s: NetService) {
         let type = s.type.trimmingCharacters(in: CharacterSet(charactersIn: "."))
-        let txt = s.txtRecordData().map { NetService.dictionary(fromTXTRecord: $0) } ?? [:]
-        func t(_ key: String) -> String? {
-            txt[key].flatMap { String(data: $0, encoding: .utf8) }.flatMap { $0.isEmpty ? nil : $0 }
-        }
+        let raw = s.txtRecordData().map { NetService.dictionary(fromTXTRecord: $0) } ?? [:]
+        var txt: [String: String] = [:]
+        for (k, v) in raw { txt[k] = String(data: v, encoding: .utf8) }
         if type.hasPrefix("_device-info") {
-            if let m = t("model") { modelsByName[s.name] = m }
+            if let m = txt["model"], !m.isEmpty { modelsByName[s.name] = m }
             return
         }
-        var name = s.name
-        if type.hasPrefix("_raop"), let at = name.firstIndex(of: "@") { name = String(name[name.index(after: at)...]) }
-        if type.hasPrefix("_googlecast"), let fn = t("fn") { name = fn }
-        let priority = Self.types.firstIndex { type.hasPrefix($0) } ?? Self.types.count
-        let isPrinter = ["_ipp", "_ipps", "_printer", "_pdl-datastream"].contains { type.hasPrefix($0) }
-        let model = isPrinter ? (t("ty") ?? t("product").map { $0.trimmingCharacters(in: CharacterSet(charactersIn: "()")) })
-            : type.hasPrefix("_raop") ? t("am")
-            : type.hasPrefix("_companion-link") ? t("rpMd")
-            : t("model") ?? t("md")
-
         for addr in s.addresses ?? [] {
             guard let ip = IPv4.from(addr) else { continue }
             var h = hosts[ip] ?? BonjourHost()
-            h.types.insert(type)
-            if priority < h.namePriority { h.name = name; h.namePriority = priority }
-            if h.model == nil { h.model = model }
-            h.add("Model", model)
-            if isPrinter {
-                h.category = "Printer"
-                h.add("Printer location", t("note"))
-                h.add("Admin page", t("adminurl"))
-            }
-            if type.hasPrefix("_hap"), let ci = t("ci").flatMap({ Int($0) }), let c = homeKitCategories[ci] {
-                h.category = c
-                h.add("HomeKit category", c)
-            }
-            if type.hasPrefix("_googlecast") {
-                h.add("Cast name", t("fn"))
-                h.add("Now playing", t("rs"))
-            }
-            if type.hasPrefix("_airplay") {
-                h.add("OS version", t("osvers"))
-                h.add("AirPlay version", t("srcvers"))
-            }
+            h.ingest(type: type, instance: s.name, txt: txt)
+            if h.hostname == nil, let host = s.hostName { h.hostname = host.hasSuffix(".") ? String(host.dropLast()) : host }
             hosts[ip] = h
         }
     }
@@ -565,9 +594,10 @@ struct Device: Identifiable, Hashable {
     var deepScanned = false
     var ipv6: [String] = []
     var lastSeen = Date()
-    /// Remembered from an earlier scan but not found in this one. The saved* fields hold what
-    /// was known when it was last seen.
+    /// Remembered from an earlier scan but not found in this one.
     var isOffline = false
+    /// What was known about this device (by MAC) last time it was seen. Used for offline rows,
+    /// and as a fallback for online devices that don't announce themselves on this scan.
     var savedName: String?
     var savedKind: String?
     var savedMaker: String?
@@ -577,8 +607,7 @@ struct Device: Identifiable, Hashable {
 
     /// The name the device announces (or that was given to it), without fallbacks.
     var realName: String? {
-        label ?? bonjourName ?? identity.upnp?.friendlyName ?? identity.netbios?.name
-            ?? (isOffline ? savedName : nil) ?? hostLabel
+        label ?? bonjourName ?? identity.upnp?.friendlyName ?? identity.netbios?.name ?? hostLabel ?? savedName
     }
     /// Hostname without ".local" and with dashes as spaces, e.g. "Jonathans-MacBook-Pro.local" → "Jonathans MacBook Pro".
     private var hostLabel: String? {
@@ -598,11 +627,11 @@ struct Device: Identifiable, Hashable {
     }
     var hasRealName: Bool { !(realName ?? "").isEmpty }
 
-    var maker: String? { vendor ?? identity.upnp?.manufacturer ?? (isOffline ? savedMaker : nil) }
+    var maker: String? { vendor ?? identity.upnp?.manufacturer ?? savedMaker }
     /// Marketing name when the identifier is a known Apple model ("iPad8,9" → "iPad Pro 11-inch (2nd gen)").
     var modelName: String? {
         if let m = model { return AppleModels.name(m) ?? m }
-        return identity.upnp?.model ?? (isOffline ? savedModel : nil)
+        return identity.upnp?.model ?? savedModel
     }
     var icon: String { DeviceIcon.symbol(for: kind) }
 
@@ -671,6 +700,12 @@ struct Device: Identifiable, Hashable {
     /// ports, maker and what its web page and SSH banner say.
     var kind: String {
         if isOffline, let k = savedKind { return k }
+        let k = detectedKind
+        if let saved = savedKind, ["Unknown", "Phone / laptop", "Web-managed device"].contains(k) { return saved }
+        return k
+    }
+
+    private var detectedKind: String {
         if isSelf { return "This Mac" }
         if isGateway { return "Router" }
         if let c = category { return c }
@@ -799,7 +834,7 @@ enum Scanner {
 
             // Give stragglers' ARP replies a moment to land, then read the cache.
             Thread.sleep(forTimeInterval: 0.5)
-            let arp = ARP.table(interface: net.interface)
+            var arp = ARP.table(interface: net.interface)
             var ips = Set(alive.keys)
             for ip in arp.keys where net.contains(ip) && ip != net.network && ip != (net.network | ~net.netmask) { ips.insert(ip) }
             ips.insert(net.address)
@@ -810,12 +845,24 @@ enum Scanner {
             let dns = OperationQueue()
             dns.maxConcurrentOperationCount = 16
             dns.addOperation { NDP.wake(interface: net.interface) }
+            var mdns: [UInt32: BonjourHost] = [:]
+            let mdnsTargets = Array(ips)
+            dns.addOperation {
+                let found = MDNS.discover(mdnsTargets, from: net.address)
+                lock.lock(); mdns = found; lock.unlock()
+            }
             for ip in ips {
                 dns.addOperation {
                     if let n = DNS.reverse(ip) { lock.lock(); names[ip] = n; lock.unlock() }
                 }
             }
             dns.waitUntilAllOperationsAreFinished()
+            // Devices that only answered the multicast mDNS query (ARP-silent until now).
+            let extra = mdns.keys.filter { net.contains($0) && !ips.contains($0) && $0 != net.network }
+            if !extra.isEmpty {
+                ips.formUnion(extra)
+                arp = ARP.table(interface: net.interface)
+            }
             let ndp = NDP.table(interface: net.interface)
             ssdpDone.wait()
 
@@ -830,7 +877,12 @@ enum Scanner {
                         d.hostname = names[ip]
                         d.openPorts = alive[ip] ?? []
                         d.responded = d.isSelf || alive[ip] != nil
-                        if let b = bj[ip] {
+                        var merged = bj[ip]
+                        if let m = mdns[ip] {
+                            if merged == nil { merged = m } else { merged?.merge(m) }
+                        }
+                        if let b = merged {
+                            d.identity.mdnsName = b.hostname
                             d.bonjourName = b.name
                             d.model = b.model
                             d.services = Array(b.types)

@@ -7,8 +7,8 @@ import Darwin
 //   • Web: the <title> and Server header of devices with a web page.
 //   • NetBIOS: a node status query on UDP 137 gives Windows / Samba computer names.
 //   • SSH: the banner on port 22 names the server software and often the OS.
-//   • mDNS: a unicast PTR query to each device's port 5353 returns its "name.local" hostname.
-// Bonjour TXT details are gathered by BonjourBrowser in Scanner.swift.
+// Bonjour details come from BonjourBrowser in Scanner.swift and from MDNS here, which asks
+// each device directly for all its services; both run during the scan, before this pass.
 // Deep Scan (one device, ~1,100 ports) lives here too.
 
 // MARK: - What was learned
@@ -356,35 +356,114 @@ enum NetBIOS {
     }
 }
 
-// MARK: - mDNS reverse lookup
+// MARK: - Direct mDNS queries
 
-/// Asks each device directly (unicast to port 5353, which Apple devices, Avahi and most IoT
-/// responders answer) for the PTR record of its own address, i.e. its "name.local" hostname.
+/// Asks devices directly over mDNS, with our own packets rather than the Bonjour API. That API
+/// only browses service types listed in Info.plist, but a device asked directly lists every
+/// service it offers, whatever the type, which is where most friendly names come from.
+///   Round 1: to each device (unicast to port 5353) and to the multicast group: "what services
+///            do you have?" (_services._dns-sd._udp.local) and "what's your hostname?" (reverse PTR).
+///   Round 2: to each device that answered: the instances of each of its service types, whose
+///            replies carry the instance names ("Living Room TV") and TXT records (models).
+/// Queries come from an ephemeral port, so responders answer unicast ("legacy unicast").
 enum MDNS {
-    static func names(for ips: [UInt32], timeout: TimeInterval = 1.5) -> [UInt32: String] {
+    private struct Record {
+        let name: [String]   // owner name labels
+        let type: Int
+        let target: [String]  // PTR/SRV target labels
+        let txt: [String: String]
+    }
+
+    static func discover(_ ips: [UInt32], from local: UInt32) -> [UInt32: BonjourHost] {
         guard !ips.isEmpty else { return [:] }
         let fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
         guard fd >= 0 else { return [:] }
         defer { close(fd) }
+        var iface = in_addr(s_addr: local.bigEndian)
+        setsockopt(fd, IPPROTO_IP, IP_MULTICAST_IF, &iface, socklen_t(MemoryLayout<in_addr>.size))
+        var ttl: UInt8 = 255
+        setsockopt(fd, IPPROTO_IP, IP_MULTICAST_TTL, &ttl, socklen_t(1))
 
-        for (n, ip) in ips.enumerated() {
-            var q: [UInt8] = [UInt8(n >> 8 & 0xFF), UInt8(n & 0xFF), 0, 0, 0, 1, 0, 0, 0, 0, 0, 0]
-            let labels = [ip & 255, (ip >> 8) & 255, (ip >> 16) & 255, ip >> 24].map { String($0) } + ["in-addr", "arpa"]
-            for l in labels { q.append(UInt8(l.utf8.count)); q += Array(l.utf8) }
-            q += [0, 0, 12, 0, 1]   // end of name, type PTR, class IN
-            var sa = IPv4.socketAddress(ip, port: 5353)
-            _ = withUnsafePointer(to: &sa) {
-                $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                    sendto(fd, q, q.count, 0, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
-                }
-            }
+        let meta = ["_services", "_dns-sd", "_udp", "local"]
+        func reverse(_ ip: UInt32) -> [String] {
+            [ip & 255, (ip >> 8) & 255, (ip >> 16) & 255, ip >> 24].map { String($0) } + ["in-addr", "arpa"]
         }
 
-        var out: [UInt32: String] = [:]
+        // Round 1
+        for ip in ips { send(fd, to: ip, questions: [meta, reverse(ip)]) }
+        send(fd, to: 0xE00000FB, questions: [meta])   // 224.0.0.251
+        var records = receive(fd, for: 1.5)
+
+        // Round 2: instances of every type each device listed
+        var typesByIP: [UInt32: Set<[String]>] = [:]
+        for (ip, rs) in records {
+            for r in rs where r.type == 12 && r.name.map({ $0.lowercased() }) == meta && r.target.count >= 3 {
+                typesByIP[ip, default: []].insert(Array(r.target.suffix(3)))
+            }
+        }
+        for (ip, types) in typesByIP {
+            let list = Array(types)
+            for chunk in stride(from: 0, to: list.count, by: 10) {
+                send(fd, to: ip, questions: Array(list[chunk..<min(chunk + 10, list.count)]))
+            }
+        }
+        if !typesByIP.isEmpty {
+            for (ip, rs) in receive(fd, for: 1.5) { records[ip, default: []] += rs }
+        }
+
+        // Make sense of it, per device
+        var out: [UInt32: BonjourHost] = [:]
+        for (ip, rs) in records {
+            var h = BonjourHost()
+            var txtByOwner: [String: [String: String]] = [:]
+            for r in rs where r.type == 16 { txtByOwner[r.name.joined(separator: ".").lowercased(), default: [:]].merge(r.txt) { a, _ in a } }
+            for r in rs {
+                let lower = r.name.map { $0.lowercased() }
+                if r.type == 12, lower.suffix(2) == ["in-addr", "arpa"], h.hostname == nil {
+                    h.hostname = r.target.joined(separator: ".")
+                } else if r.type == 12, lower == meta, r.target.count >= 3 {
+                    h.types.insert(r.target.suffix(3).dropLast().joined(separator: "."))
+                } else if r.type == 12, r.name.count == 3, r.target.count == 4 {
+                    // "_airplay._tcp.local" → "Living Room._airplay._tcp.local"
+                    let type = r.name.prefix(2).joined(separator: ".")
+                    let txt = txtByOwner[r.target.joined(separator: ".").lowercased()] ?? [:]
+                    h.ingest(type: type, instance: r.target[0], txt: txt)
+                } else if r.type == 33, h.hostname == nil, !r.target.isEmpty {
+                    h.hostname = r.target.joined(separator: ".")
+                }
+            }
+            if h.name != nil || h.hostname != nil || !h.types.isEmpty { out[ip] = h }
+        }
+        return out
+    }
+
+    // MARK: wire format
+
+    private static func send(_ fd: Int32, to ip: UInt32, questions: [[String]]) {
+        var q: [UInt8] = [0, 0, 0, 0, 0, UInt8(questions.count), 0, 0, 0, 0, 0, 0]
+        for name in questions {
+            for label in name {
+                let bytes = Array(label.utf8.prefix(63))
+                q.append(UInt8(bytes.count))
+                q += bytes
+            }
+            q += [0, 0, 12, 0, 1]   // end of name, type PTR, class IN
+        }
+        var sa = IPv4.socketAddress(ip, port: 5353)
+        _ = withUnsafePointer(to: &sa) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                sendto(fd, q, q.count, 0, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
+        }
+    }
+
+    /// Collects every record from every reply that arrives within the window, by sender.
+    private static func receive(_ fd: Int32, for timeout: TimeInterval) -> [UInt32: [Record]] {
+        var out: [UInt32: [Record]] = [:]
         let deadline = Date().addingTimeInterval(timeout)
-        var buf = [UInt8](repeating: 0, count: 1500)
+        var buf = [UInt8](repeating: 0, count: 9000)
         let cap = buf.count
-        while out.count < ips.count {
+        while true {
             let remaining = Int32(deadline.timeIntervalSinceNow * 1000)
             guard remaining > 0 else { break }
             var p = pollfd(fd: fd, events: Int16(POLLIN), revents: 0)
@@ -394,46 +473,65 @@ enum MDNS {
             let n = withUnsafeMutablePointer(to: &from) {
                 $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { recvfrom(fd, &buf, cap, 0, $0, &len) }
             }
-            guard n > 0, let name = firstPTR(Array(buf[0..<n])) else { continue }
-            out[UInt32(bigEndian: from.sin_addr.s_addr)] = name
+            guard n > 0 else { continue }
+            out[UInt32(bigEndian: from.sin_addr.s_addr), default: []] += parse(Array(buf[0..<n]))
         }
         return out
     }
 
-    /// The target of the first PTR answer in a DNS response.
-    private static func firstPTR(_ m: [UInt8]) -> String? {
-        guard m.count >= 12 else { return nil }
-        let qd = Int(m[4]) << 8 | Int(m[5])
-        let an = Int(m[6]) << 8 | Int(m[7])
+    private static func parse(_ m: [UInt8]) -> [Record] {
+        guard m.count >= 12 else { return [] }
+        func u16(_ o: Int) -> Int { Int(m[o]) << 8 | Int(m[o + 1]) }
+        let qd = u16(4)
+        let rrs = u16(6) + u16(8) + u16(10)   // answers + authority + additional
         var o = 12
         for _ in 0..<qd {
-            guard let q = name(m, at: o), q.1 + 4 <= m.count else { return nil }
+            guard let q = name(m, at: o), q.1 + 4 <= m.count else { return [] }
             o = q.1 + 4
         }
-        for _ in 0..<an {
-            guard let a = name(m, at: o), a.1 + 10 <= m.count else { return nil }
-            let next = a.1
-            let type = Int(m[next]) << 8 | Int(m[next + 1])
-            let rdlen = Int(m[next + 8]) << 8 | Int(m[next + 9])
-            let rdata = next + 10
-            guard rdata + rdlen <= m.count else { return nil }
-            if type == 12, let target = name(m, at: rdata)?.0 {
-                return target.hasSuffix(".") ? String(target.dropLast()) : target
+        var out: [Record] = []
+        for _ in 0..<rrs {
+            guard let owner = name(m, at: o), owner.1 + 10 <= m.count else { break }
+            let at = owner.1
+            let type = u16(at)
+            let rdlen = u16(at + 8)
+            let rdata = at + 10
+            guard rdata + rdlen <= m.count else { break }
+            switch type {
+            case 12:
+                if let t = name(m, at: rdata) { out.append(Record(name: owner.0, type: 12, target: t.0, txt: [:])) }
+            case 33:
+                if rdlen > 6, let t = name(m, at: rdata + 6) { out.append(Record(name: owner.0, type: 33, target: t.0, txt: [:])) }
+            case 16:
+                var txt: [String: String] = [:]
+                var i = rdata
+                while i < rdata + rdlen {
+                    let l = Int(m[i])
+                    guard i + 1 + l <= rdata + rdlen else { break }
+                    let entry = String(decoding: m[(i + 1)..<(i + 1 + l)], as: UTF8.self)
+                    if let eq = entry.firstIndex(of: "=") {
+                        txt[String(entry[..<eq])] = String(entry[entry.index(after: eq)...])
+                    }
+                    i += 1 + l
+                }
+                out.append(Record(name: owner.0, type: 16, target: [], txt: txt))
+            default:
+                break
             }
             o = rdata + rdlen
         }
-        return nil
+        return out
     }
 
-    /// Decodes a (possibly compressed) DNS name; returns it and the offset just past it.
-    private static func name(_ m: [UInt8], at start: Int) -> (String, Int)? {
+    /// Decodes a (possibly compressed) DNS name into labels; returns them and the offset past it.
+    private static func name(_ m: [UInt8], at start: Int) -> ([String], Int)? {
         var labels: [String] = []
         var o = start
         var end: Int?
         var jumps = 0
         while o < m.count {
             let len = Int(m[o])
-            if len == 0 { if end == nil { end = o + 1 }; return (labels.joined(separator: "."), end!) }
+            if len == 0 { return (labels, end ?? o + 1) }
             if len & 0xC0 == 0xC0 {
                 guard o + 1 < m.count, jumps < 16 else { return nil }
                 if end == nil { end = o + 2 }
@@ -479,10 +577,6 @@ enum Identify {
         queue.addOperation {
             let names = NetBIOS.names(for: others.map(\.ipKey))
             for (ip, n) in names { update(ip) { $0.netbios = n } }
-        }
-        queue.addOperation {
-            let names = MDNS.names(for: devices.map(\.ipKey))
-            for (ip, n) in names { update(ip) { $0.mdnsName = n } }
         }
         for (ip, answer) in ssdp {
             if let server = answer.server { update(ip) { $0.upnpServer = server } }

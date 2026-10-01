@@ -26,7 +26,8 @@ A small Mac app that shows what's on your local network: every device's icon, IP
    - **Web**: the page title and `Server` header of devices with a web page (e.g. "ASUS RT-AX86U", "Synology DiskStation").
    - **Windows networking**: a NetBIOS name query returns Windows PCs' and Samba NAS boxes' computer names and workgroups.
    - **SSH**: the banner on port 22 names the server software and often the OS (e.g. Ubuntu, Raspbian).
-   - **mDNS hostname**: a direct PTR query to each device's port 5353 returns its `name.local`.
+   - **Direct mDNS**: each device (and the mDNS multicast group) is asked over raw mDNS for every service it offers (`_services._dns-sd._udp`) and its `name.local` hostname, then for the instances of each of those services. Unlike the Bonjour API, which macOS limits to the service types listed in Info.plist, this sees every type, so far more devices get names, models and hostnames.
+   - **Memory**: names, types, makers and models are remembered by MAC address, so a device that's quiet on one scan keeps what it said before.
 6. **IPv6**: a ping to the all-nodes multicast address fills the NDP cache, and `ndp -an` maps each device's IPv6 addresses to its MAC.
 7. **Model names**: Apple model identifiers (`iPad8,9`) are shown as marketing names ("iPad Pro 11-inch (2nd gen)").
 8. **Type** is a best guess from all of the above (Bonjour model and category and UPnP first, then services, open ports, maker, and web/SSH hints).
