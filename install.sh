@@ -15,5 +15,5 @@ tccutil reset All com.jonpike.networkscanner >/dev/null 2>&1 || true
 echo "Installed $APP"
 open "$APP"
 echo
-echo "Network Scanner launched: look for the globe in your menu bar."
+echo "Network Scanner launched."
 echo "Allow Local Network access when macOS asks, or scans will find nothing."
