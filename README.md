@@ -1,14 +1,14 @@
 # Network Scanner
 
-A small macOS menu bar app that shows what's on your local network: every device's IP address, name, type, maker, MAC address and open ports. Devices that weren't there last time are marked **NEW**. It's three Swift files with no Xcode project and no dependencies, and it doesn't need admin rights.
+A small Mac app that shows what's on your local network: every device's IP address, name, type, maker, MAC address and open ports. Devices that weren't there last time are marked **NEW**. It's three Swift files with no Xcode project and no dependencies, and it doesn't need admin rights.
 
 ## Using it
 
-- **Click the globe** in the menu bar. The menu shows your network, the device count, **Show Devices…** (⌘D) and **Scan Now** (⌘R).
-- **The Devices window** lists everything found. Click a column to sort, type in Filter to search, and **Copy List** puts the table on the clipboard (tab separated, pastes into a spreadsheet).
+- **Open it** like any app. It scans as soon as it opens; **Scan → Scan Now** (⌘R) rescans. Closing the window quits it.
+- **The window** shows your network and device count at the top and lists everything found. Click a column to sort, type in Filter to search, and **Copy List** puts the table on the clipboard (tab separated, pastes into a spreadsheet).
 - **Double-click a device** to give it a name. Names are remembered by MAC address. Right-click for Copy IP/MAC and **Open in Browser** for devices with a web page (routers, printers, NAS).
 - A **green dot** means the device answered this scan. A **grey dot** means it's in the Mac's ARP cache but didn't answer: usually a sleeping phone, or something that left in the last few minutes.
-- **Rescan Every 10 Minutes** (on by default) keeps the list fresh. **Forget Remembered Devices…** clears names and NEW tracking.
+- The **Scan** menu has **Rescan Every 10 Minutes** (on by default, while the app is open), **Look Up Device Makers** and **Forget Remembered Devices…**, which clears names and NEW tracking.
 
 ## How it finds devices
 
@@ -35,7 +35,7 @@ macOS 15 and later ask for **Local Network** access the first time it scans. All
 
 ### Updates
 
-Network Scanner checks `updates/latest.json` in this repo shortly after launch and every 6 hours. When a newer version exists, the globe gets a dot in its corner and the menu shows **⬆︎ Install Update to vX…**. Installing shows the release notes and asks first, then downloads `updates/NetworkScanner.zip`, quits, swaps the app in place, resets its permissions and relaunches. **Update Source…** in the menu can point it at a different feed, such as a local file for testing.
+Network Scanner checks `updates/latest.json` in this repo shortly after launch and every 6 hours. When a newer version exists, the Dock icon gets a ↑ badge, the window shows an **⬆︎ Update to vX…** button, and the Network Scanner menu shows **⬆︎ Install Update to vX…** in place of **Check for Updates…**. Installing shows the release notes and asks first, then downloads `updates/NetworkScanner.zip`, quits, swaps the app in place, resets its permissions and relaunches. **Update Source…** in the Network Scanner menu can point it at a different feed, such as a local file for testing.
 
 To ship a release:
 
@@ -49,7 +49,7 @@ UPDATE_NOTES="What changed" ./release.sh   # universal build → updates/Network
 
 ### Version and build
 
-The menu shows the version, build number and build time, e.g. *Version 1.0 (build 12) · 1 Oct 2026 at 14:03*. The build number is the repo's commit count and the time is stamped into the bundle's Info.plist by `build.sh` / `release.sh`.
+The Network Scanner menu shows the version, build number and build time, e.g. *Version 1.0 (build 12) · 1 Oct 2026 at 14:03*. The build number is the repo's commit count and the time is stamped into the bundle's Info.plist by `build.sh` / `release.sh`.
 
 ### Icon
 

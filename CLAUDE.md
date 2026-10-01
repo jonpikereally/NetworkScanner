@@ -1,9 +1,9 @@
 # Network Scanner
 
-macOS menu bar app (AppKit + a SwiftUI table) that lists devices on the local network.
+Regular macOS windowed app (AppKit + a SwiftUI table; not a menu bar app) that lists devices on the local network.
 Plain swiftc, no Xcode project, no dependencies, macOS 14+.
 
-- `NetworkScanner.swift`: app delegate, menu, menu bar icon, devices window, remembered devices.
+- `NetworkScanner.swift`: app delegate, main menu, Dock badge, devices window, remembered devices.
 - `Scanner.swift`: interface/gateway discovery, TCP probes, ARP cache, reverse DNS, Bonjour, OUI makers.
 - `Updater.swift`: the shared self-update scheme (same as PasteStack and Curtain). Keep it in sync with those.
 

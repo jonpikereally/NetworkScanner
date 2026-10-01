@@ -20,8 +20,6 @@
 	<string>NetworkScanner</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>14.0</string>
-	<key>LSUIElement</key>
-	<true/>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>Network Scanner looks for the devices on your local network so it can list them.</string>
 	<key>NSBonjourServices</key>
