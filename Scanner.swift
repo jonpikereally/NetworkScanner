@@ -9,6 +9,7 @@ import SystemConfiguration
 //      that ignore TCP entirely, with their MAC addresses.
 //   3. Bonjour (mDNS) browsing and reverse DNS supply names, models and services.
 //   4. The MAC's first bytes give the maker, from Wireshark's public OUI list (optional).
+//   Then Identify.swift asks each device for more (UPnP, web page, NetBIOS, SSH).
 
 // MARK: - Address helpers
 
@@ -186,13 +187,26 @@ enum Probe {
     ]
     static let webPorts: [UInt16] = [80, 8080, 443, 8443]
 
+    private static let nameLock = NSLock()
+    private static var nameCache: [UInt16: String] = [:]
+
+    /// Short service name for a port: our own list first, then /etc/services.
+    static func name(_ port: UInt16) -> String? {
+        if let n = ports[port] { return n }
+        nameLock.lock(); defer { nameLock.unlock() }
+        if let n = nameCache[port] { return n.isEmpty ? nil : n }
+        let n = getservbyport(Int32(port.bigEndian), "tcp").map { String(cString: $0.pointee.s_name) } ?? ""
+        nameCache[port] = n
+        return n.isEmpty ? nil : n
+    }
+
     /// One non-blocking connect per port, all polled together. A host is alive if any port
     /// accepts or actively refuses; silence and "host unreachable" mean nobody's there.
-    static func probe(_ host: UInt32, timeoutMs: Int = 700) -> (alive: Bool, open: [UInt16]) {
+    static func probe(_ host: UInt32, ports list: [UInt16]? = nil, timeoutMs: Int = 700) -> (alive: Bool, open: [UInt16]) {
         var alive = false
         var open: [UInt16] = []
         var pending: [Int32: UInt16] = [:]
-        for port in ports.keys {
+        for port in list ?? Array(ports.keys) {
             let fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)
             guard fd >= 0 else { continue }
             var one: Int32 = 1
@@ -290,7 +304,25 @@ struct BonjourHost {
     var namePriority = Int.max
     var types: Set<String> = []
     var model: String?
+    var category: String?
+    var facts: [Fact] = []
+
+    mutating func add(_ label: String, _ value: String?) {
+        guard let v = Net.clean(value) else { return }
+        let f = Fact(source: "Bonjour", label: label, value: v)
+        if !facts.contains(f) { facts.append(f) }
+    }
 }
+
+/// HomeKit accessory categories (the "ci" TXT key).
+private let homeKitCategories: [Int: String] = [
+    2: "HomeKit bridge", 3: "Fan", 4: "Garage door opener", 5: "Light", 6: "Door lock", 7: "Smart plug",
+    8: "Switch", 9: "Thermostat", 10: "Sensor", 11: "Security system", 12: "Door", 13: "Window",
+    14: "Window covering", 15: "Button", 16: "Range extender", 17: "Camera", 18: "Video doorbell",
+    19: "Air purifier", 20: "Heater", 21: "Air conditioner", 22: "Humidifier", 23: "Dehumidifier",
+    28: "Sprinkler", 29: "Faucet", 30: "Shower", 31: "TV", 32: "Remote", 33: "Wi-Fi router",
+    34: "Audio receiver", 35: "TV box", 36: "Streaming stick",
+]
 
 /// Browses common service types for a few seconds and maps what it finds to IPv4 addresses.
 /// Runs on the main run loop.
@@ -332,7 +364,7 @@ final class BonjourBrowser: NSObject, NetServiceBrowserDelegate, NetServiceDeleg
             services = []
             var out = hosts
             for (ip, h) in out where h.model == nil {
-                if let n = h.name, let m = modelsByName[n] { out[ip]?.model = m }
+                if let n = h.name, let m = modelsByName[n] { out[ip]?.model = m; out[ip]?.add("Model", m) }
             }
             completion(out)
         }
@@ -365,7 +397,11 @@ final class BonjourBrowser: NSObject, NetServiceBrowserDelegate, NetServiceDeleg
         if type.hasPrefix("_raop"), let at = name.firstIndex(of: "@") { name = String(name[name.index(after: at)...]) }
         if type.hasPrefix("_googlecast"), let fn = t("fn") { name = fn }
         let priority = Self.types.firstIndex { type.hasPrefix($0) } ?? Self.types.count
-        let model = t("model") ?? t("md")
+        let isPrinter = ["_ipp", "_ipps", "_printer", "_pdl-datastream"].contains { type.hasPrefix($0) }
+        let model = isPrinter ? (t("ty") ?? t("product").map { $0.trimmingCharacters(in: CharacterSet(charactersIn: "()")) })
+            : type.hasPrefix("_raop") ? t("am")
+            : type.hasPrefix("_companion-link") ? t("rpMd")
+            : t("model") ?? t("md")
 
         for addr in s.addresses ?? [] {
             guard let ip = IPv4.from(addr) else { continue }
@@ -373,6 +409,24 @@ final class BonjourBrowser: NSObject, NetServiceBrowserDelegate, NetServiceDeleg
             h.types.insert(type)
             if priority < h.namePriority { h.name = name; h.namePriority = priority }
             if h.model == nil { h.model = model }
+            h.add("Model", model)
+            if isPrinter {
+                h.category = "Printer"
+                h.add("Printer location", t("note"))
+                h.add("Admin page", t("adminurl"))
+            }
+            if type.hasPrefix("_hap"), let ci = t("ci").flatMap({ Int($0) }), let c = homeKitCategories[ci] {
+                h.category = c
+                h.add("HomeKit category", c)
+            }
+            if type.hasPrefix("_googlecast") {
+                h.add("Cast name", t("fn"))
+                h.add("Now playing", t("rs"))
+            }
+            if type.hasPrefix("_airplay") {
+                h.add("OS version", t("osvers"))
+                h.add("AirPlay version", t("srcvers"))
+            }
             hosts[ip] = h
         }
     }
@@ -476,11 +530,50 @@ struct Device: Identifiable, Hashable {
     var isNew = false
     var label: String?
     var firstSeen = Date()
+    var category: String?        // HomeKit category or "Printer", from Bonjour
+    var bonjourFacts: [Fact] = []
+    var identity = Identity()    // filled in by the identify pass (Identify.swift)
+    var deepScanned = false
 
     var randomizedMAC: Bool { mac.map(MAC.isRandomized) ?? false }
-    var displayName: String { label ?? bonjourName ?? hostname ?? "" }
+    var displayName: String {
+        label ?? bonjourName ?? identity.upnp?.friendlyName ?? identity.netbios?.name ?? hostname ?? ""
+    }
+    var maker: String? { vendor ?? identity.upnp?.manufacturer }
+    var modelName: String? { model ?? identity.upnp?.model }
+
+    /// Everything learned about the device, grouped by where it came from.
+    var facts: [Fact] {
+        var f: [Fact] = []
+        func add(_ source: String, _ label: String, _ value: String?) {
+            if let v = Net.clean(value) { f.append(Fact(source: source, label: label, value: v)) }
+        }
+        if let u = identity.upnp {
+            add("UPnP", "Name", u.friendlyName)
+            add("UPnP", "Manufacturer", u.manufacturer)
+            add("UPnP", "Model", u.model)
+            add("UPnP", "Description", u.modelDescription)
+            add("UPnP", "Device type", u.shortType)
+            add("UPnP", "Firmware", u.firmware)
+            add("UPnP", "Admin page", u.presentationURL)
+        }
+        add("UPnP", "Server", identity.upnpServer)
+        f += bonjourFacts
+        if let w = identity.web {
+            add("Web", "Page title", w.title)
+            add("Web", "Server", w.server)
+            add("Web", "Address", w.url)
+        }
+        if let n = identity.netbios {
+            add("Windows networking", "Computer name", n.name)
+            add("Windows networking", "Workgroup", n.workgroup)
+        }
+        add("SSH", "Banner", identity.ssh)
+        return f
+    }
     var knownKey: String { mac ?? "ip:\(ip)" }
     var webURL: URL? {
+        if let p = identity.upnp?.presentationURL, let u = URL(string: p), u.host == ip { return u }
         if openPorts.contains(443) { return URL(string: "https://\(ip)") }
         if openPorts.contains(80) { return URL(string: "http://\(ip)") }
         if openPorts.contains(8443) { return URL(string: "https://\(ip):8443") }
@@ -491,12 +584,13 @@ struct Device: Identifiable, Hashable {
     // Sort keys for the table
     var statusRank: Int { isSelf ? 0 : isGateway ? 1 : responded ? 2 : 3 }
     var sortName: String { displayName.isEmpty ? "\u{FFFF}" : displayName.lowercased() }
-    var sortVendor: String { (vendor ?? "\u{FFFF}").lowercased() }
+    var sortVendor: String { (maker ?? "\u{FFFF}").lowercased() }
+    var sortModel: String { (modelName ?? "\u{FFFF}").lowercased() }
     var sortMAC: String { mac ?? "\u{FFFF}" }
     var portCount: Int { openPorts.count }
 
     var portSummary: String {
-        openPorts.map { p in Probe.ports[p].map { "\($0) (\(p))" } ?? "\(p)" }.joined(separator: ", ")
+        openPorts.map { p in Probe.name(p).map { "\($0) (\(p))" } ?? "\(p)" }.joined(separator: ", ")
     }
 
     var serviceSummary: String {
@@ -506,10 +600,12 @@ struct Device: Identifiable, Hashable {
         }.sorted().joined(separator: ", ")
     }
 
-    /// Best guess at what the device is, from Bonjour model, services, ports and maker.
+    /// Best guess at what the device is: Bonjour model and category, UPnP, then services,
+    /// ports, maker and what its web page and SSH banner say.
     var kind: String {
         if isSelf { return "This Mac" }
         if isGateway { return "Router" }
+        if let c = category { return c }
         if let m = model?.lowercased() {
             if m.hasPrefix("macbook") { return "Mac laptop" }
             if m.hasPrefix("imac") || m.hasPrefix("macmini") || m.hasPrefix("macpro") || m.hasPrefix("mac") { return "Mac" }
@@ -521,8 +617,29 @@ struct Device: Identifiable, Hashable {
             if m.contains("chromecast") || m.contains("google") { return "Chromecast / Google device" }
         }
         let s = Set(services.map { $0.components(separatedBy: ".").first ?? $0 })
-        let v = (vendor ?? "").lowercased()
+        let v = (maker ?? "").lowercased()
         let p = Set(openPorts)
+        let u = identity.upnp
+        let um = ((u?.model ?? "") + " " + (u?.friendlyName ?? "")).lowercased()
+        let hints = [identity.web?.title, identity.web?.server, identity.upnpServer, identity.ssh]
+            .compactMap { $0?.lowercased() }.joined(separator: " ")
+        switch u?.shortType ?? "" {
+        case "InternetGatewayDevice", "WANDevice", "WANConnectionDevice": return "Router"
+        case "ZonePlayer": return "Sonos speaker"
+        case "Printer": return "Printer"
+        case "MediaServer": return "Media server / NAS"
+        default: break
+        }
+        if um.contains("xbox") || um.contains("playstation") || v.contains("nintendo") { return "Game console" }
+        if um.contains("roku") || v.contains("roku") { return "Roku" }
+        if um.contains("hue bridge") || (v.contains("philips") && um.contains("hue")) { return "Hue bridge" }
+        if u?.shortType == "MediaRenderer" || u?.deviceType?.contains("dial") == true,
+           s.isDisjoint(with: ["_googlecast", "_airplay", "_raop", "_sonos"]) {
+            return ["samsung", "lg ", "lg electronics", "sony", "vizio", "tcl", "hisense", "panasonic", "philips"]
+                .contains { v.contains($0) || um.contains($0) } ? "TV" : "Media player"
+        }
+        if hints.contains("synology") || hints.contains("diskstation") || hints.contains("qnap") || hints.contains("truenas") { return "NAS" }
+        if hints.contains("openwrt") || hints.contains("routeros") || hints.contains("unifi") || hints.contains("dd-wrt") { return "Network device" }
         if s.contains("_googlecast") { return "Chromecast / Google TV" }
         if s.contains("_sonos") || p.contains(1400) || v.contains("sonos") { return "Sonos speaker" }
         if !s.isDisjoint(with: ["_ipp", "_ipps", "_printer", "_pdl-datastream"]) || p.contains(9100) || p.contains(631) { return "Printer" }
@@ -539,6 +656,9 @@ struct Device: Identifiable, Hashable {
         if v.contains("roku") { return "Roku" }
         if v.contains("espressif") || v.contains("tuya") || v.contains("shelly") || v.contains("ring") || v.contains("nest") { return "Smart home device" }
         if !s.isDisjoint(with: ["_smb", "_afpovertcp", "_workstation"]) || p.contains(445) || p.contains(548) { return "Computer / NAS" }
+        if identity.netbios != nil { return "Windows PC / file server" }
+        if hints.contains("raspbian") { return "Raspberry Pi" }
+        if hints.contains("ubuntu") || hints.contains("debian") || hints.contains("fedora") || hints.contains("linux") { return "Linux computer" }
         if s.contains("_rfb") || s.contains("_ssh") || s.contains("_sftp-ssh") || p.contains(22) || p.contains(3389) { return "Computer" }
         if v.contains("apple") { return "Apple device" }
         if v.contains("samsung") || v.contains("lg electronics") || v.contains("vizio") || v.contains("tcl") || v.contains("hisense") { return "TV / appliance" }
@@ -576,6 +696,14 @@ enum Scanner {
                 return
             }
             Probe.raiseFileLimit()
+            // UPnP discovery listens while the sweep runs.
+            var ssdp: [UInt32: SSDP.Answer] = [:]
+            let ssdpDone = DispatchGroup()
+            ssdpDone.enter()
+            DispatchQueue.global(qos: .userInitiated).async {
+                ssdp = SSDP.discover(from: net.address, duration: 4)
+                ssdpDone.leave()
+            }
             let range = net.scanRange
             let targets = range.hosts.filter { $0 != net.address }
             let lock = NSLock()
@@ -594,7 +722,7 @@ enum Scanner {
                     lock.unlock()
                     if d % 8 == 0 || d == targets.count {
                         DispatchQueue.main.async {
-                            progress(0.85 * Double(d) / Double(max(1, targets.count)), "Probing \(d) of \(targets.count) addresses\u{2026}")
+                            progress(0.7 * Double(d) / Double(max(1, targets.count)), "Probing \(d) of \(targets.count) addresses\u{2026}")
                         }
                     }
                 }
@@ -609,7 +737,7 @@ enum Scanner {
             ips.insert(net.address)
             if let gw = net.gateway { ips.insert(gw) }
 
-            DispatchQueue.main.async { progress(0.9, "Looking up names\u{2026}") }
+            DispatchQueue.main.async { progress(0.75, "Looking up names\u{2026}") }
             var names: [UInt32: String] = [:]
             let dns = OperationQueue()
             dns.maxConcurrentOperationCount = 16
@@ -619,6 +747,7 @@ enum Scanner {
                 }
             }
             dns.waitUntilAllOperationsAreFinished()
+            ssdpDone.wait()
 
             DispatchQueue.main.async {
                 bonjour.finish(minimum: 6) { bj in
@@ -635,13 +764,21 @@ enum Scanner {
                             d.bonjourName = b.name
                             d.model = b.model
                             d.services = Array(b.types)
+                            d.category = b.category
+                            d.bonjourFacts = b.facts
                         }
                         d.vendor = d.mac.flatMap { VendorDB.shared.lookup($0) }
                         devices.append(d)
                     }
-                    completion(.success(ScanOutcome(network: net, scannedCIDR: range.cidr, trimmed: range.trimmed,
-                                                    devices: devices.sorted { $0.ipKey < $1.ipKey },
-                                                    nothingAnswered: alive.isEmpty)))
+                    progress(0.85, "Identifying \(devices.count) devices\u{2026}")
+                    DispatchQueue.global(qos: .userInitiated).async {
+                        let identified = Identify.run(devices, ssdp: ssdp)
+                        DispatchQueue.main.async {
+                            completion(.success(ScanOutcome(network: net, scannedCIDR: range.cidr, trimmed: range.trimmed,
+                                                            devices: identified.sorted { $0.ipKey < $1.ipKey },
+                                                            nothingAnswered: alive.isEmpty)))
+                        }
+                    }
                 }
             }
         }
