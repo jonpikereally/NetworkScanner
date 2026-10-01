@@ -103,6 +103,14 @@ final class ScanStore: ObservableObject {
                 k.lastSeen = now
                 d.label = k.label
                 d.firstSeen = k.firstSeen
+                // Fall back on what it said last time if it's quiet this scan. Only for devices
+                // known by MAC: an IP alone may since belong to something else.
+                if d.mac != nil {
+                    d.savedName = k.name
+                    d.savedKind = k.kind
+                    d.savedMaker = k.maker
+                    d.savedModel = k.model
+                }
                 known[d.knownKey] = k
             } else {
                 d.isNew = !firstEverScan && !d.isSelf
