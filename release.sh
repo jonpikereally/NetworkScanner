@@ -42,7 +42,7 @@ codesign --force --sign - /Applications/NetworkScanner.app
 tccutil reset All com.jonpike.networkscanner >/dev/null 2>&1
 open /Applications/NetworkScanner.app
 echo
-echo "Done! Look for the globe in your menu bar."
+echo "Done! Network Scanner is in your Applications folder."
 echo "Allow Local Network access when macOS asks, or scans will find nothing."
 INSTALL
 chmod +x "$DIST/NetworkScanner/Install Network Scanner.command"
@@ -58,7 +58,7 @@ INSTALL
    Local Network). Without it, scans find nothing.
 
 USE
-• Click the globe in the menu bar. Show Devices… opens the list; Scan Now rescans.
+• Open Network Scanner from Applications. It scans when it opens; ⌘R rescans.
 • Devices new since the last scan are marked NEW. Double-click a device to name it.
 • Right-click a device to copy its address or open its web page.
 
