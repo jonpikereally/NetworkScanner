@@ -12,6 +12,12 @@ struct KnownDevice: Codable {
     var firstSeen: Date
     var lastSeen: Date
     var label: String?
+    // Snapshot from the last time it was seen, so it can be listed while offline.
+    var lastIP: String?
+    var name: String?
+    var kind: String?
+    var maker: String?
+    var model: String?
 }
 
 enum KnownDevices {
@@ -43,6 +49,12 @@ final class ScanStore: ObservableObject {
     @Published var nothingAnswered = false
     /// Newer version waiting on GitHub, shown as a button in the window.
     @Published var updateVersion: String?
+    /// List devices remembered from earlier scans that weren't found this time.
+    @Published var showOffline: Bool = UserDefaults.standard.object(forKey: "ShowOffline") as? Bool ?? true {
+        didSet { UserDefaults.standard.set(showOffline, forKey: "ShowOffline") }
+    }
+    /// When the next automatic scan is due, for the countdown in the status bar.
+    @Published var nextScan: Date?
     /// Deep scans in progress: device ID → progress 0…1.
     @Published var deepScans: [String: Double] = [:]
     /// Ports found by deep scans this session, keyed like KnownDevices, so rescans keep them.
@@ -73,12 +85,16 @@ final class ScanStore: ObservableObject {
         })
     }
 
+    /// Remembered devices are listed as offline for this long after they were last seen.
+    private static let offlineRetention: TimeInterval = 30 * 86400
+
     private func apply(_ outcome: ScanOutcome) {
         var known = KnownDevices.load()
         let firstEverScan = known.isEmpty
         let now = Date()
-        devices = outcome.devices.map { d in
+        var online = outcome.devices.map { d in
             var d = d
+            d.lastSeen = now
             if let extra = deepPorts[d.knownKey] {
                 d.openPorts = Array(Set(d.openPorts).union(extra)).sorted()
                 d.deepScanned = true
@@ -95,6 +111,30 @@ final class ScanStore: ObservableObject {
             }
             return d
         }
+        for d in online {
+            known[d.knownKey]?.lastIP = d.ip
+            known[d.knownKey]?.name = d.realName
+            known[d.knownKey]?.kind = d.kind
+            known[d.knownKey]?.maker = d.maker
+            known[d.knownKey]?.model = d.modelName
+        }
+        let seen = Set(online.map(\.knownKey))
+        for (key, k) in known where !seen.contains(key) && now.timeIntervalSince(k.lastSeen) < Self.offlineRetention {
+            guard let ip = k.lastIP else { continue }
+            var d = Device(ip: ip, ipKey: IPv4.parse(ip) ?? 0)
+            d.mac = key.hasPrefix("ip:") ? nil : key
+            d.isOffline = true
+            d.label = k.label
+            d.firstSeen = k.firstSeen
+            d.lastSeen = k.lastSeen
+            d.savedName = k.name
+            d.savedKind = k.kind
+            d.savedMaker = k.maker
+            d.savedModel = k.model
+            d.vendor = d.mac.flatMap { VendorDB.shared.lookup($0) }
+            online.append(d)
+        }
+        devices = online
         KnownDevices.save(known)
         network = outcome.network
         scannedCIDR = outcome.scannedCIDR
@@ -117,7 +157,7 @@ final class ScanStore: ObservableObject {
     /// Probes ~1,100 ports on one device, then re-runs the web and SSH checks.
     func deepScan(_ device: Device) {
         let id = device.id
-        guard deepScans[id] == nil else { return }
+        guard deepScans[id] == nil, !device.isOffline else { return }
         deepScans[id] = 0
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             let open = DeepScan.run(device.ipKey) { p in self?.deepScans[id] = p }
@@ -151,14 +191,19 @@ final class ScanStore: ObservableObject {
         if scanning { return status.isEmpty ? "Scanning\u{2026}" : status }
         if let error { return error }
         guard let lastScan else { return "Not scanned yet" }
-        let n = devices.count
+        let n = onlineCount
         let new = devices.filter(\.isNew).count
-        var s = "\(n) device\(n == 1 ? "" : "s")"
+        let offline = devices.count - n
+        var s = "\(n) device\(n == 1 ? "" : "s") online"
         if new > 0 { s += ", \(new) new" }
+        if offline > 0 { s += ", \(offline) offline" }
         let f = RelativeDateTimeFormatter()
         f.unitsStyle = .short
         return s + " \u{00B7} scanned \(f.localizedString(for: lastScan, relativeTo: Date()))"
     }
+
+    var onlineCount: Int { devices.filter { !$0.isOffline }.count }
+    var visibleDevices: [Device] { showOffline ? devices : devices.filter { !$0.isOffline } }
 
     var networkLine: String {
         guard let n = network else { return "No network" }
@@ -169,9 +214,11 @@ final class ScanStore: ObservableObject {
     }
 
     func text(of rows: [Device]) -> String {
-        var lines = ["IP Address\tName\tType\tMaker\tModel\tMAC Address\tOpen Ports\tServices"]
+        var lines = ["IP Address\tName\tType\tMaker\tModel\tMAC Address\tIPv6\tHostname\tOpen Ports\tServices\tLast Seen\tStatus"]
         for d in rows {
-            lines.append([d.ip, d.displayName, d.kind, d.maker ?? "", d.modelName ?? "", d.mac ?? "", d.portSummary, d.serviceSummary]
+            lines.append([d.ip, d.displayName, d.kind, d.maker ?? "", d.modelName ?? "", d.mac ?? "",
+                          d.ipv6.joined(separator: " "), d.bestHostname ?? "", d.portSummary, d.serviceSummary,
+                          d.lastSeen.formatted(date: .numeric, time: .shortened), d.isOffline ? "offline" : "online"]
                 .joined(separator: "\t"))
         }
         return lines.joined(separator: "\n")
@@ -185,11 +232,19 @@ struct DevicesView: View {
     @State private var sortOrder = [KeyPathComparator(\Device.ipKey)]
     @State private var filter = ""
     @State private var selection = Set<Device.ID>()
+    /// Which columns are shown and their order; right-click the header to change. Saved across launches.
+    @State private var columns: TableColumnCustomization<Device> = {
+        guard let data = UserDefaults.standard.data(forKey: "TableColumns"),
+              let saved = try? JSONDecoder().decode(TableColumnCustomization<Device>.self, from: data) else { return .init() }
+        return saved
+    }()
 
     private var rows: [Device] {
         let q = filter.trimmingCharacters(in: .whitespaces).lowercased()
-        let shown = q.isEmpty ? store.devices : store.devices.filter { d in
-            [d.ip, d.displayName, d.kind, d.maker ?? "", d.modelName ?? "", d.mac ?? "", d.hostname ?? "", d.serviceSummary]
+        let all = store.visibleDevices
+        let shown = q.isEmpty ? all : all.filter { d in
+            [d.ip, d.displayName, d.kind, d.maker ?? "", d.modelName ?? "", d.mac ?? "", d.bestHostname ?? "",
+             d.serviceSummary, d.ipv6.joined(separator: " ")]
                 .contains { $0.lowercased().contains(q) }
         }
         return shown.sorted(using: sortOrder)
@@ -207,8 +262,10 @@ struct DevicesView: View {
                         .frame(minWidth: 280, idealWidth: 330, maxWidth: 480)
                 }
             }
+            Divider()
+            statusBar
         }
-        .frame(minWidth: 900, minHeight: 400)
+        .frame(minWidth: 900, minHeight: 420)
     }
 
     private var header: some View {
@@ -244,6 +301,29 @@ struct DevicesView: View {
         .padding(12)
     }
 
+    /// Bottom bar: device counts and the countdown to the next automatic scan.
+    private var statusBar: some View {
+        HStack {
+            Text(store.summary).lineLimit(1)
+            Spacer()
+            TimelineView(.periodic(from: .now, by: 1)) { context in
+                if store.scanning {
+                    Text("Scanning\u{2026}")
+                } else if let next = store.nextScan {
+                    let secs = max(0, Int(next.timeIntervalSince(context.date).rounded()))
+                    Text(secs >= 60 ? "Next scan in \(secs / 60) min \(secs % 60) s" : "Next scan in \(secs) s")
+                        .monospacedDigit()
+                } else {
+                    Text("Automatic scans off")
+                }
+            }
+        }
+        .font(.caption)
+        .foregroundStyle(.secondary)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 5)
+    }
+
     private var localNetworkHint: some View {
         HStack {
             Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.yellow)
@@ -261,56 +341,94 @@ struct DevicesView: View {
     }
 
     private var table: some View {
-        Table(rows, selection: $selection, sortOrder: $sortOrder) {
-            TableColumn("", value: \.statusRank) { d in
-                Circle()
-                    .fill(d.responded ? Color.green : Color.secondary.opacity(0.5))
-                    .frame(width: 8, height: 8)
-                    .help(d.responded ? "Answered this scan" : "In the Mac's ARP cache but didn't answer a probe (asleep, or left recently)")
-            }
-            .width(16)
-            TableColumn("IP Address", value: \.ipKey) { d in
-                Text(d.ip).monospacedDigit()
-            }
-            .width(min: 100, ideal: 115)
+        Table(rows, selection: $selection, sortOrder: $sortOrder, columnCustomization: $columns) {
             TableColumn("Name", value: \.sortName) { d in
                 HStack(spacing: 6) {
-                    Text(d.displayName.isEmpty ? "\u{2014}" : d.displayName)
-                        .foregroundStyle(d.displayName.isEmpty ? Color.secondary : Color.primary)
-                        .help(d.hostname.map { "Hostname: \($0)" } ?? "")
+                    Image(systemName: d.icon)
+                        .frame(width: 18)
+                        .foregroundStyle(d.isOffline ? Color.secondary : Color.accentColor)
+                    Text(d.displayName)
+                        .foregroundStyle(d.hasRealName && !d.isOffline ? Color.primary : Color.secondary)
                     if d.isNew {
                         Text("NEW").font(.caption2.bold()).foregroundStyle(.white)
                             .padding(.horizontal, 4).padding(.vertical, 1)
                             .background(Capsule().fill(Color.accentColor))
                     }
+                    Spacer(minLength: 4)
+                    if !d.isOffline {
+                        Circle()
+                            .fill(d.responded ? Color.green : Color.secondary.opacity(0.5))
+                            .frame(width: 7, height: 7)
+                            .help(d.responded ? "Online: answered this scan" : "In the Mac's ARP cache but didn't answer (asleep, or left recently)")
+                    }
                 }
+                .help(d.isOffline ? "Offline: last seen \(d.lastSeen.formatted(date: .abbreviated, time: .shortened))" : "")
             }
-            .width(min: 140, ideal: 200)
+            .width(min: 170, ideal: 230)
+            .customizationID("name")
+            .disabledCustomizationBehavior(.visibility)
+            TableColumn("IP Address", value: \.ipKey) { d in
+                Text(d.ip).monospacedDigit().foregroundStyle(d.isOffline ? Color.secondary : Color.primary)
+            }
+            .width(min: 95, ideal: 110)
+            .customizationID("ip")
             TableColumn("Type", value: \.kind) { d in
-                Text(d.kind)
+                Text(d.kind).foregroundStyle(d.isOffline ? Color.secondary : Color.primary)
             }
-            .width(min: 100, ideal: 150)
+            .width(min: 90, ideal: 140)
+            .customizationID("type")
             TableColumn("Maker", value: \.sortVendor) { d in
                 Text(d.maker ?? (d.randomizedMAC ? "Private address" : "\u{2014}"))
-                    .foregroundStyle(d.maker == nil ? Color.secondary : Color.primary)
+                    .foregroundStyle(d.maker == nil || d.isOffline ? Color.secondary : Color.primary)
                     .help(d.randomizedMAC && d.maker == nil ? "This device uses a private (randomized) Wi-Fi address, so its maker can't be looked up." : "")
             }
-            .width(min: 100, ideal: 150)
+            .width(min: 90, ideal: 140)
+            .customizationID("maker")
             TableColumn("Model", value: \.sortModel) { d in
                 Text(d.modelName ?? "\u{2014}")
-                    .foregroundStyle(d.modelName == nil ? Color.secondary : Color.primary)
+                    .foregroundStyle(d.modelName == nil || d.isOffline ? Color.secondary : Color.primary)
+                    .help(d.model.map { "Identifier: \($0)" } ?? "")
             }
-            .width(min: 90, ideal: 150)
+            .width(min: 90, ideal: 160)
+            .customizationID("model")
             TableColumn("MAC Address", value: \.sortMAC) { d in
-                Text(d.mac ?? "\u{2014}").font(.system(.body, design: .monospaced))
+                Text(d.mac?.uppercased() ?? "\u{2014}").font(.system(.body, design: .monospaced))
+                    .foregroundStyle(d.isOffline ? Color.secondary : Color.primary)
             }
-            .width(min: 130, ideal: 140)
+            .width(min: 130, ideal: 145)
+            .customizationID("mac")
+            TableColumn("IPv6", value: \.sortIPv6) { d in
+                Text(d.ipv6.first?.uppercased() ?? "\u{2014}")
+                    .font(.system(.body, design: .monospaced))
+                    .foregroundStyle(d.ipv6.isEmpty || d.isOffline ? Color.secondary : Color.primary)
+                    .help(d.ipv6.joined(separator: "\n"))
+            }
+            .width(min: 100, ideal: 170)
+            .customizationID("ipv6")
+            TableColumn("Hostname", value: \.sortHost) { d in
+                Text(d.bestHostname ?? "\u{2014}")
+                    .foregroundStyle(d.bestHostname == nil || d.isOffline ? Color.secondary : Color.primary)
+            }
+            .width(min: 100, ideal: 170)
+            .customizationID("hostname")
             TableColumn("Open Ports", value: \.portCount) { d in
                 Text(d.portSummary.isEmpty ? "\u{2014}" : d.portSummary)
-                    .foregroundStyle(d.portSummary.isEmpty ? Color.secondary : Color.primary)
+                    .foregroundStyle(d.portSummary.isEmpty || d.isOffline ? Color.secondary : Color.primary)
                     .help(d.serviceSummary.isEmpty ? "" : "Bonjour: \(d.serviceSummary)")
             }
-            .width(min: 100, ideal: 180)
+            .width(min: 90, ideal: 160)
+            .customizationID("ports")
+            .defaultVisibility(.hidden)
+            TableColumn("Last Seen", value: \.lastSeen) { d in
+                Text(d.isOffline ? d.lastSeen.formatted(date: .abbreviated, time: .shortened) : "Now")
+                    .monospacedDigit()
+                    .foregroundStyle(Color.secondary)
+            }
+            .width(min: 90, ideal: 130)
+            .customizationID("lastSeen")
+        }
+        .onChange(of: columns) { _, new in
+            if let data = try? JSONEncoder().encode(new) { UserDefaults.standard.set(data, forKey: "TableColumns") }
         }
         .contextMenu(forSelectionType: Device.ID.self) { ids in
             if let d = device(ids) {
@@ -318,7 +436,7 @@ struct DevicesView: View {
                 if d.label != nil { Button("Clear Name") { store.rename(d, to: nil) } }
                 Divider()
                 Button(d.deepScanned ? "Deep Scan Again" : "Deep Scan") { store.deepScan(d) }
-                    .disabled(store.deepScans[d.id] != nil)
+                    .disabled(store.deepScans[d.id] != nil || d.isOffline)
                 Divider()
                 Button("Copy IP Address") { copy(d.ip) }
                 if let mac = d.mac { Button("Copy MAC Address") { copy(mac) } }
@@ -338,7 +456,7 @@ struct DevicesView: View {
 
     private func device(_ ids: Set<Device.ID>) -> Device? {
         guard ids.count == 1, let id = ids.first else { return nil }
-        return store.devices.first { $0.id == id }
+        return store.visibleDevices.first { $0.id == id }
     }
 
     private func copy(_ s: String) {
@@ -375,10 +493,14 @@ struct DeviceDetailView: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 16) {
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(device.displayName.isEmpty ? device.ip : device.displayName)
+                    Text(device.displayName)
                         .font(.title3.bold())
                         .textSelection(.enabled)
-                    Text(device.kind).foregroundStyle(.secondary)
+                    HStack(spacing: 5) {
+                        Image(systemName: device.icon)
+                        Text(device.kind)
+                    }
+                    .foregroundStyle(.secondary)
                 }
                 HStack {
                     Button("Rename\u{2026}", action: onRename)
@@ -408,12 +530,19 @@ struct DeviceDetailView: View {
     }
 
     private var basics: [(String, String)] {
-        var rows = [("IP address", device.ip)]
-        if let mac = device.mac { rows.append(("MAC address", mac + (device.randomizedMAC ? " (private)" : ""))) }
+        var rows = [(device.isOffline ? "Last IP address" : "IP address", device.ip)]
+        if let mac = device.mac { rows.append(("MAC address", mac.uppercased() + (device.randomizedMAC ? " (private)" : ""))) }
+        for (i, a) in device.ipv6.enumerated() { rows.append((i == 0 ? "IPv6" : "", a)) }
         if let m = device.maker { rows.append(("Maker", m)) }
-        if let m = device.modelName { rows.append(("Model", m)) }
+        if let m = device.modelName {
+            rows.append(("Model", m + (device.model.map { $0 != m ? " (\($0))" : "" } ?? "")))
+        }
         if let h = device.hostname { rows.append(("Hostname", h)) }
-        rows.append(("Status", device.responded ? "Answered this scan" : "In ARP cache only (asleep or just left)"))
+        if let h = device.identity.mdnsName, h != device.hostname { rows.append(("mDNS name", h)) }
+        let status = device.isOffline ? "Offline"
+            : device.responded ? "Online, answered this scan" : "In ARP cache only (asleep or just left)"
+        rows.append(("Status", status))
+        rows.append(("Last seen", device.isOffline ? device.lastSeen.formatted(date: .abbreviated, time: .shortened) : "Now"))
         rows.append(("First seen", device.firstSeen.formatted(date: .abbreviated, time: .shortened)))
         return rows
     }
@@ -434,7 +563,9 @@ struct DeviceDetailView: View {
             HStack {
                 Text("Open ports").font(.headline)
                 Spacer()
-                if let p = store.deepScans[device.id] {
+                if device.isOffline {
+                    EmptyView()
+                } else if let p = store.deepScans[device.id] {
                     ProgressView(value: p).frame(width: 90)
                     Text("Deep scanning\u{2026}").font(.caption).foregroundStyle(.secondary)
                 } else {
@@ -510,15 +641,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var autoTimer: Timer?
     private var checkingForUpdates = false
 
-    private var autoScan: Bool {
-        get { UserDefaults.standard.object(forKey: "AutoScan") as? Bool ?? true }
-        set { UserDefaults.standard.set(newValue, forKey: "AutoScan") }
+    /// Seconds between automatic scans; 0 = off. Older versions stored an on/off "AutoScan".
+    private var scanInterval: TimeInterval {
+        get {
+            if let v = UserDefaults.standard.object(forKey: "ScanInterval") as? Double { return v }
+            return (UserDefaults.standard.object(forKey: "AutoScan") as? Bool ?? true) ? 300 : 0
+        }
+        set { UserDefaults.standard.set(newValue, forKey: "ScanInterval") }
     }
+    private static let intervals: [(String, TimeInterval)] = [
+        ("Off", 0), ("Every Minute", 60), ("Every 5 Minutes", 300), ("Every 10 Minutes", 600), ("Every 30 Minutes", 1800),
+    ]
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.mainMenu = buildMainMenu()
 
-        store.onChange = { [weak self] in self?.render() }
+        store.onChange = { [weak self] in
+            guard let self else { return }
+            // Each finished scan starts the countdown to the next one.
+            if !self.store.scanning && self.store.nextScan == nil { self.scheduleAutoScan() }
+            if self.store.scanning { self.autoTimer?.invalidate(); self.store.nextScan = nil }
+            self.render()
+        }
         store.onInstallUpdate = { [weak self] in self?.checkForUpdates() }
         Updater.shared.onChange = { [weak self] in self?.render() }
         Updater.shared.startAutomaticChecks()
@@ -526,7 +670,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         showDevices()
         render()
-        scheduleAutoScan()
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in self?.store.scan() }
     }
 
@@ -543,7 +686,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let available = Updater.shared.available?.version
         if store.updateVersion != available { store.updateVersion = available }
         NSApp.dockTile.badgeLabel = available != nil ? "\u{2191}" : nil
-        window?.subtitle = store.summary
+        let n = store.onlineCount
+        window?.title = store.lastScan == nil ? "Network Scanner" : "Network Scanner (\(n) device\(n == 1 ? "" : "s"))"
     }
 
     // MARK: menus
@@ -619,9 +763,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let scan = item(store.scanning ? "Scanning\u{2026}" : "Scan Now", #selector(scanNow), key: "r")
         scan.isEnabled = !store.scanning
         menu.addItem(scan)
-        let auto = item("Rescan Every 10 Minutes", #selector(toggleAutoScan))
-        auto.state = autoScan ? .on : .off
+        let auto = NSMenuItem(title: "Scan Automatically", action: nil, keyEquivalent: "")
+        let sub = NSMenu(title: "Scan Automatically")
+        for (i, (title, secs)) in Self.intervals.enumerated() {
+            let choice = item(title, #selector(setScanInterval(_:)))
+            choice.tag = i
+            choice.state = scanInterval == secs ? .on : .off
+            sub.addItem(choice)
+        }
+        auto.submenu = sub
         menu.addItem(auto)
+        let offline = item("Show Offline Devices", #selector(toggleOffline))
+        offline.state = store.showOffline ? .on : .off
+        menu.addItem(offline)
         menu.addItem(.separator())
         let makers = item("Look Up Device Makers", #selector(toggleMakers))
         makers.state = VendorDB.shared.enabled ? .on : .off
@@ -659,7 +813,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc private func showDevices() {
         if window == nil {
-            let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1000, height: 560),
+            let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1240, height: 620),
                              styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
             w.title = "Network Scanner"
             w.isReleasedWhenClosed = false
@@ -673,16 +827,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         render()
     }
 
-    @objc private func toggleAutoScan() {
-        autoScan.toggle()
-        scheduleAutoScan()
+    @objc private func setScanInterval(_ sender: NSMenuItem) {
+        scanInterval = Self.intervals[sender.tag].1
+        if !store.scanning { scheduleAutoScan() }
     }
 
+    @objc private func toggleOffline() { store.showOffline.toggle() }
+
+    /// One-shot timer for the next automatic scan; re-armed when each scan finishes.
     private func scheduleAutoScan() {
         autoTimer?.invalidate()
         autoTimer = nil
-        guard autoScan else { return }
-        let t = Timer(timeInterval: 600, repeats: true) { [weak self] _ in self?.store.scan() }
+        guard scanInterval > 0 else { store.nextScan = nil; return }
+        let fire = Date().addingTimeInterval(scanInterval)
+        store.nextScan = fire
+        let t = Timer(fire: fire, interval: 0, repeats: false) { [weak self] _ in self?.store.scan() }
         RunLoop.main.add(t, forMode: .common)
         autoTimer = t
     }
@@ -698,13 +857,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func forgetDevices() {
         let alert = NSAlert()
         alert.messageText = "Forget remembered devices?"
-        alert.informativeText = "Network Scanner forgets every device it has seen and the names you gave them. "
+        alert.informativeText = "Network Scanner forgets every device it has seen, including offline ones, and the names you gave them. "
             + "The next scan starts fresh, so nothing will be marked new."
         alert.addButton(withTitle: "Forget")
         alert.addButton(withTitle: "Cancel")
         guard alert.runModal() == .alertFirstButtonReturn else { return }
         KnownDevices.save([:])
-        store.devices = store.devices.map { var d = $0; d.label = nil; d.isNew = false; return d }
+        store.devices = store.devices.filter { !$0.isOffline }.map { var d = $0; d.label = nil; d.isNew = false; return d }
         render()
     }
 

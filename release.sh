@@ -15,7 +15,7 @@ if [[ -z "${UPDATE_NOTES:-}" && -f RELEASE_NOTES.txt ]]; then
 fi
 BUILD=$(git rev-list --count HEAD 2>/dev/null || echo 0)
 CACHE="${TMPDIR:-/tmp}/networkscanner-modcache"
-SOURCES=(NetworkScanner.swift Scanner.swift Identify.swift Updater.swift)
+SOURCES=(NetworkScanner.swift Scanner.swift Identify.swift Catalog.swift Updater.swift)
 mkdir -p "$CACHE" "$CACHE-x86"
 echo "Building arm64…"
 swiftc -O -target arm64-apple-macos14 -module-cache-path "$CACHE" \
