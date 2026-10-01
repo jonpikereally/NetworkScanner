@@ -143,6 +143,18 @@ enum HTTP {
         return URLSession(configuration: c, delegate: LocalTrust(), delegateQueue: nil)
     }()
 
+    /// Blocking request with the shared URLSession (internet downloads); full body.
+    static func fetch(_ req: URLRequest) -> (Data, HTTPURLResponse)? {
+        let sem = DispatchSemaphore(value: 0)
+        var out: (Data, HTTPURLResponse)?
+        URLSession.shared.dataTask(with: req) { data, response, _ in
+            if let data, let http = response as? HTTPURLResponse { out = (data, http) }
+            sem.signal()
+        }.resume()
+        _ = sem.wait(timeout: .now() + 90)
+        return out
+    }
+
     /// Blocking GET. Returns the body (first 256 KB) and response, or nil.
     static func get(_ url: URL) -> (Data, HTTPURLResponse)? {
         var req = URLRequest(url: url)
@@ -392,6 +404,11 @@ enum MDNS {
         // Round 1
         for ip in ips { send(fd, to: ip, questions: [meta, reverse(ip)]) }
         send(fd, to: 0xE00000FB, questions: [meta])   // 224.0.0.251
+        // Some devices (iOS especially) answer multicast questions but ignore ones sent straight
+        // to them, so ask the group for every address's hostname too, 20 per packet.
+        for chunk in stride(from: 0, to: ips.count, by: 20) {
+            send(fd, to: 0xE00000FB, questions: ips[chunk..<min(chunk + 20, ips.count)].map(reverse))
+        }
         var records = receive(fd, for: 1.5)
 
         // Round 2: instances of every type each device listed
