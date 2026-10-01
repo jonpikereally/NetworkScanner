@@ -1,7 +1,7 @@
 import AppKit
 import SwiftUI
 
-// Network Scanner: a menu bar app that lists the devices on the local network.
+// Network Scanner: a Mac app that lists the devices on the local network.
 // Scanning lives in Scanner.swift, in-app updates in Updater.swift.
 
 // MARK: - Remembered devices
@@ -41,7 +41,10 @@ final class ScanStore: ObservableObject {
     @Published var lastScan: Date?
     @Published var error: String?
     @Published var nothingAnswered = false
+    /// Newer version waiting on GitHub, shown as a button in the window.
+    @Published var updateVersion: String?
     var onChange: () -> Void = {}
+    var onInstallUpdate: () -> Void = {}
 
     func scan() {
         guard !scanning else { return }
@@ -184,6 +187,11 @@ struct DevicesView: View {
                 }
             }
             Spacer()
+            if let v = store.updateVersion {
+                Button("\u{2B06}\u{FE0E} Update to v\(v)\u{2026}") { store.onInstallUpdate() }
+                    .buttonStyle(.borderedProminent)
+                    .help("A new version of Network Scanner is ready to install")
+            }
             TextField("Filter", text: $filter)
                 .textFieldStyle(.roundedBorder)
                 .frame(width: 180)
@@ -192,7 +200,6 @@ struct DevicesView: View {
             }
             .disabled(store.devices.isEmpty)
             Button(store.scanning ? "Scanning\u{2026}" : "Scan Now") { store.scan() }
-                .keyboardShortcut("r")
                 .disabled(store.scanning)
         }
         .padding(12)
@@ -320,12 +327,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let delegate = AppDelegate()
         retained = delegate
         app.delegate = delegate
-        app.setActivationPolicy(.accessory)
+        app.setActivationPolicy(.regular)
         app.run()
     }
 
     private let store = ScanStore()
-    private var statusItem: NSStatusItem!
     private var window: NSWindow?
     private var autoTimer: Timer?
     private var checkingForUpdates = false
@@ -336,106 +342,88 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-        let menu = NSMenu()
-        menu.delegate = self
-        statusItem.menu = menu
+        NSApp.mainMenu = buildMainMenu()
 
         store.onChange = { [weak self] in self?.render() }
+        store.onInstallUpdate = { [weak self] in self?.checkForUpdates() }
         Updater.shared.onChange = { [weak self] in self?.render() }
         Updater.shared.startAutomaticChecks()
         VendorDB.shared.prepare { [weak self] in self?.store.refreshVendors() }
 
+        showDevices()
         render()
         scheduleAutoScan()
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in self?.store.scan() }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in self?.store.scan() }
     }
+
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
         showDevices()
         return false
     }
 
-    // MARK: menu bar icon
-
+    /// Mirrors update and scan state into the window, its title and the Dock icon.
+    /// An update waiting shows as an arrow badge on the Dock icon and a button in the window.
     private func render() {
-        guard let button = statusItem?.button else { return }
-        let update = Updater.shared.available != nil
-        button.image = Self.icon(scanning: store.scanning, update: update)
-        button.toolTip = "Network Scanner \u{2014} " + store.summary
-            + (update ? "\nUpdate available: v\(Updater.shared.available!.version)" : "")
+        let available = Updater.shared.available?.version
+        if store.updateVersion != available { store.updateVersion = available }
+        NSApp.dockTile.badgeLabel = available != nil ? "\u{2191}" : nil
+        window?.subtitle = store.summary
     }
 
-    /// The network glyph; a filled dot in the corner means an update is waiting.
-    static func icon(scanning: Bool, update: Bool) -> NSImage {
-        let name = scanning ? "antenna.radiowaves.left.and.right" : "network"
-        let config = NSImage.SymbolConfiguration(pointSize: 14, weight: .regular)
-        let base = NSImage(systemSymbolName: name, accessibilityDescription: "Network Scanner")?
-            .withSymbolConfiguration(config) ?? NSImage()
-        guard update else {
-            base.isTemplate = true
-            return base
-        }
-        let dot: CGFloat = 6
-        let size = NSSize(width: base.size.width + 3, height: base.size.height)
-        let image = NSImage(size: size, flipped: false) { _ in
-            base.draw(in: NSRect(origin: .zero, size: base.size))
-            let badge = NSRect(x: size.width - dot, y: size.height - dot, width: dot, height: dot)
-            NSGraphicsContext.current?.compositingOperation = .clear
-            NSBezierPath(ovalIn: badge.insetBy(dx: -1.5, dy: -1.5)).fill()
-            NSGraphicsContext.current?.compositingOperation = .sourceOver
-            NSColor.black.setFill()
-            NSBezierPath(ovalIn: badge).fill()
-            return true
-        }
-        image.isTemplate = true
-        image.accessibilityDescription = "Network Scanner, update available"
-        return image
+    // MARK: menus
+
+    private func buildMainMenu() -> NSMenu {
+        let main = NSMenu()
+
+        let app = NSMenu(title: "Network Scanner")
+        app.delegate = self
+        app.addItem(withTitle: "About Network Scanner", action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)), keyEquivalent: "")
+        app.addItem(.separator())
+        // Update items are filled in by menuNeedsUpdate so their titles stay current.
+        app.addItem(.separator())
+        app.addItem(withTitle: "Hide Network Scanner", action: #selector(NSApplication.hide(_:)), keyEquivalent: "h")
+        let hideOthers = app.addItem(withTitle: "Hide Others", action: #selector(NSApplication.hideOtherApplications(_:)), keyEquivalent: "h")
+        hideOthers.keyEquivalentModifierMask = [.command, .option]
+        app.addItem(withTitle: "Show All", action: #selector(NSApplication.unhideAllApplications(_:)), keyEquivalent: "")
+        app.addItem(.separator())
+        app.addItem(withTitle: "Quit Network Scanner", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        main.addItem(submenu(app))
+
+        let edit = NSMenu(title: "Edit")
+        edit.addItem(withTitle: "Undo", action: Selector(("undo:")), keyEquivalent: "z")
+        edit.addItem(withTitle: "Redo", action: Selector(("redo:")), keyEquivalent: "Z")
+        edit.addItem(.separator())
+        edit.addItem(withTitle: "Cut", action: #selector(NSText.cut(_:)), keyEquivalent: "x")
+        edit.addItem(withTitle: "Copy", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
+        edit.addItem(withTitle: "Paste", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
+        edit.addItem(withTitle: "Select All", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
+        main.addItem(submenu(edit))
+
+        let scan = NSMenu(title: "Scan")
+        scan.delegate = self
+        main.addItem(submenu(scan))
+
+        let window = NSMenu(title: "Window")
+        window.addItem(withTitle: "Minimize", action: #selector(NSWindow.performMiniaturize(_:)), keyEquivalent: "m")
+        window.addItem(withTitle: "Zoom", action: #selector(NSWindow.performZoom(_:)), keyEquivalent: "")
+        window.addItem(.separator())
+        window.addItem(item("Devices", #selector(showDevices), key: "1"))
+        main.addItem(submenu(window))
+        NSApp.windowsMenu = window
+
+        let help = NSMenu(title: "Help")
+        help.addItem(item("Network Scanner on GitHub", #selector(openGitHub)))
+        main.addItem(submenu(help))
+        NSApp.helpMenu = help
+        return main
     }
 
-    // MARK: menu
-
-    func menuNeedsUpdate(_ menu: NSMenu) {
-        menu.removeAllItems()
-
-        let net = NSMenuItem(title: store.networkLine, action: nil, keyEquivalent: "")
-        net.isEnabled = false
-        menu.addItem(net)
-        let summary = NSMenuItem(title: store.summary, action: nil, keyEquivalent: "")
-        summary.isEnabled = false
-        menu.addItem(summary)
-        menu.addItem(.separator())
-
-        menu.addItem(item("Show Devices\u{2026}", #selector(showDevices), key: "d"))
-        let scan = item(store.scanning ? "Scanning\u{2026}" : "Scan Now", #selector(scanNow), key: "r")
-        scan.isEnabled = !store.scanning
-        menu.addItem(scan)
-        let auto = item("Rescan Every 10 Minutes", #selector(toggleAutoScan))
-        auto.state = autoScan ? .on : .off
-        menu.addItem(auto)
-        let makers = item("Look Up Device Makers", #selector(toggleMakers))
-        makers.state = VendorDB.shared.enabled ? .on : .off
-        makers.toolTip = "Downloads the public MAC address maker list from wireshark.org about once a month."
-        menu.addItem(makers)
-        menu.addItem(item("Forget Remembered Devices\u{2026}", #selector(forgetDevices)))
-        menu.addItem(.separator())
-
-        let updateTitle = Updater.shared.available.map { "\u{2B06}\u{FE0E} Install Update to v\($0.version)\u{2026}" }
-            ?? "Check for Updates\u{2026}"
-        let update = item(checkingForUpdates ? "Checking for Updates\u{2026}" : updateTitle, #selector(checkForUpdates))
-        update.isEnabled = !checkingForUpdates
-        menu.addItem(update)
-        menu.addItem(item("Update Source\u{2026}", #selector(editUpdateSource)))
-        menu.addItem(item("Network Scanner on GitHub", #selector(openGitHub)))
-        var versionTitle = "Version \(AppVersion.version) (build \(AppVersion.build))"
-        if let date = AppVersion.buildDate {
-            versionTitle += " \u{00B7} \(date.formatted(date: .abbreviated, time: .shortened))"
-        }
-        let version = NSMenuItem(title: versionTitle, action: nil, keyEquivalent: "")
-        version.isEnabled = false
-        menu.addItem(version)
-        menu.addItem(.separator())
-        menu.addItem(NSMenuItem(title: "Quit Network Scanner", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
+    private func submenu(_ menu: NSMenu) -> NSMenuItem {
+        let i = NSMenuItem(title: menu.title, action: nil, keyEquivalent: "")
+        i.submenu = menu
+        return i
     }
 
     private func item(_ title: String, _ action: Selector, key: String = "") -> NSMenuItem {
@@ -444,11 +432,60 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return i
     }
 
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        switch menu.title {
+        case "Scan": fillScanMenu(menu)
+        case "Network Scanner": fillUpdateItems(menu)
+        default: break
+        }
+    }
+
+    private func fillScanMenu(_ menu: NSMenu) {
+        menu.removeAllItems()
+        let scan = item(store.scanning ? "Scanning\u{2026}" : "Scan Now", #selector(scanNow), key: "r")
+        scan.isEnabled = !store.scanning
+        menu.addItem(scan)
+        let auto = item("Rescan Every 10 Minutes", #selector(toggleAutoScan))
+        auto.state = autoScan ? .on : .off
+        menu.addItem(auto)
+        menu.addItem(.separator())
+        let makers = item("Look Up Device Makers", #selector(toggleMakers))
+        makers.state = VendorDB.shared.enabled ? .on : .off
+        makers.toolTip = "Downloads the public MAC address maker list from wireshark.org about once a month."
+        menu.addItem(makers)
+        menu.addItem(item("Forget Remembered Devices\u{2026}", #selector(forgetDevices)))
+    }
+
+    /// The update block sits between the first two separators of the app menu.
+    private func fillUpdateItems(_ menu: NSMenu) {
+        let tag = 77
+        menu.items.filter { $0.tag == tag }.forEach(menu.removeItem)
+        let updateTitle = Updater.shared.available.map { "\u{2B06}\u{FE0E} Install Update to v\($0.version)\u{2026}" }
+            ?? "Check for Updates\u{2026}"
+        let update = item(checkingForUpdates ? "Checking for Updates\u{2026}" : updateTitle, #selector(checkForUpdates))
+        update.isEnabled = !checkingForUpdates
+        var versionTitle = "Version \(AppVersion.version) (build \(AppVersion.build))"
+        if let date = AppVersion.buildDate {
+            versionTitle += " \u{00B7} \(date.formatted(date: .abbreviated, time: .shortened))"
+        }
+        let version = NSMenuItem(title: versionTitle, action: nil, keyEquivalent: "")
+        version.isEnabled = false
+        let items = [update, item("Update Source\u{2026}", #selector(editUpdateSource)),
+                     item("Network Scanner on GitHub", #selector(openGitHub)), version]
+        let at = (menu.items.firstIndex { $0.isSeparatorItem } ?? 0) + 1
+        for (n, i) in items.enumerated() {
+            i.tag = tag
+            menu.insertItem(i, at: at + n)
+        }
+    }
+
+    // MARK: actions
+
     @objc private func scanNow() { store.scan() }
 
     @objc private func showDevices() {
         if window == nil {
-            let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1000, height: 520),
+            let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1000, height: 560),
                              styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
             w.title = "Network Scanner"
             w.isReleasedWhenClosed = false
@@ -459,6 +496,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         NSApp.activate(ignoringOtherApps: true)
         window?.makeKeyAndOrderFront(nil)
+        render()
     }
 
     @objc private func toggleAutoScan() {
@@ -490,7 +528,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             + "The next scan starts fresh, so nothing will be marked new."
         alert.addButton(withTitle: "Forget")
         alert.addButton(withTitle: "Cancel")
-        NSApp.activate(ignoringOtherApps: true)
         guard alert.runModal() == .alertFirstButtonReturn else { return }
         KnownDevices.save([:])
         store.devices = store.devices.map { var d = $0; d.label = nil; d.isNew = false; return d }
@@ -516,7 +553,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 let alert = NSAlert()
                 alert.messageText = "Network Scanner is up to date"
                 alert.informativeText = "You're running v\(AppVersion.version), the newest version available."
-                NSApp.activate(ignoringOtherApps: true)
                 alert.runModal()
             case .failure(let error):
                 self.showUpdateError(error)
@@ -549,11 +585,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if case UpdateError.noFeed = error {
             alert.addButton(withTitle: "Set Update Source\u{2026}")
             alert.addButton(withTitle: "Cancel")
-            NSApp.activate(ignoringOtherApps: true)
             if alert.runModal() == .alertFirstButtonReturn { editUpdateSource() }
             return
         }
-        NSApp.activate(ignoringOtherApps: true)
         alert.runModal()
     }
 
@@ -569,7 +603,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         alert.addButton(withTitle: "Save")
         alert.addButton(withTitle: "Cancel")
         alert.window.initialFirstResponder = field
-        NSApp.activate(ignoringOtherApps: true)
         guard alert.runModal() == .alertFirstButtonReturn else { return }
         let value = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
         if !value.isEmpty && Updater.url(from: value) == nil {
