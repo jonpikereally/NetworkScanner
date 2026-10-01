@@ -7,6 +7,7 @@ import Darwin
 //   • Web: the <title> and Server header of devices with a web page.
 //   • NetBIOS: a node status query on UDP 137 gives Windows / Samba computer names.
 //   • SSH: the banner on port 22 names the server software and often the OS.
+//   • mDNS: a unicast PTR query to each device's port 5353 returns its "name.local" hostname.
 // Bonjour TXT details are gathered by BonjourBrowser in Scanner.swift.
 // Deep Scan (one device, ~1,100 ports) lives here too.
 
@@ -62,6 +63,7 @@ struct Identity: Hashable {
     var web: WebInfo?
     var netbios: NetBIOSInfo?
     var ssh: String?
+    var mdnsName: String?
 }
 
 // MARK: - Small socket helpers
@@ -354,6 +356,99 @@ enum NetBIOS {
     }
 }
 
+// MARK: - mDNS reverse lookup
+
+/// Asks each device directly (unicast to port 5353, which Apple devices, Avahi and most IoT
+/// responders answer) for the PTR record of its own address, i.e. its "name.local" hostname.
+enum MDNS {
+    static func names(for ips: [UInt32], timeout: TimeInterval = 1.5) -> [UInt32: String] {
+        guard !ips.isEmpty else { return [:] }
+        let fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
+        guard fd >= 0 else { return [:] }
+        defer { close(fd) }
+
+        for (n, ip) in ips.enumerated() {
+            var q: [UInt8] = [UInt8(n >> 8 & 0xFF), UInt8(n & 0xFF), 0, 0, 0, 1, 0, 0, 0, 0, 0, 0]
+            let labels = [ip & 255, (ip >> 8) & 255, (ip >> 16) & 255, ip >> 24].map { String($0) } + ["in-addr", "arpa"]
+            for l in labels { q.append(UInt8(l.utf8.count)); q += Array(l.utf8) }
+            q += [0, 0, 12, 0, 1]   // end of name, type PTR, class IN
+            var sa = IPv4.socketAddress(ip, port: 5353)
+            _ = withUnsafePointer(to: &sa) {
+                $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                    sendto(fd, q, q.count, 0, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+                }
+            }
+        }
+
+        var out: [UInt32: String] = [:]
+        let deadline = Date().addingTimeInterval(timeout)
+        var buf = [UInt8](repeating: 0, count: 1500)
+        let cap = buf.count
+        while out.count < ips.count {
+            let remaining = Int32(deadline.timeIntervalSinceNow * 1000)
+            guard remaining > 0 else { break }
+            var p = pollfd(fd: fd, events: Int16(POLLIN), revents: 0)
+            guard poll(&p, 1, remaining) > 0 else { break }
+            var from = sockaddr_in()
+            var len = socklen_t(MemoryLayout<sockaddr_in>.size)
+            let n = withUnsafeMutablePointer(to: &from) {
+                $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { recvfrom(fd, &buf, cap, 0, $0, &len) }
+            }
+            guard n > 0, let name = firstPTR(Array(buf[0..<n])) else { continue }
+            out[UInt32(bigEndian: from.sin_addr.s_addr)] = name
+        }
+        return out
+    }
+
+    /// The target of the first PTR answer in a DNS response.
+    private static func firstPTR(_ m: [UInt8]) -> String? {
+        guard m.count >= 12 else { return nil }
+        let qd = Int(m[4]) << 8 | Int(m[5])
+        let an = Int(m[6]) << 8 | Int(m[7])
+        var o = 12
+        for _ in 0..<qd {
+            guard let q = name(m, at: o), q.1 + 4 <= m.count else { return nil }
+            o = q.1 + 4
+        }
+        for _ in 0..<an {
+            guard let a = name(m, at: o), a.1 + 10 <= m.count else { return nil }
+            let next = a.1
+            let type = Int(m[next]) << 8 | Int(m[next + 1])
+            let rdlen = Int(m[next + 8]) << 8 | Int(m[next + 9])
+            let rdata = next + 10
+            guard rdata + rdlen <= m.count else { return nil }
+            if type == 12, let target = name(m, at: rdata)?.0 {
+                return target.hasSuffix(".") ? String(target.dropLast()) : target
+            }
+            o = rdata + rdlen
+        }
+        return nil
+    }
+
+    /// Decodes a (possibly compressed) DNS name; returns it and the offset just past it.
+    private static func name(_ m: [UInt8], at start: Int) -> (String, Int)? {
+        var labels: [String] = []
+        var o = start
+        var end: Int?
+        var jumps = 0
+        while o < m.count {
+            let len = Int(m[o])
+            if len == 0 { if end == nil { end = o + 1 }; return (labels.joined(separator: "."), end!) }
+            if len & 0xC0 == 0xC0 {
+                guard o + 1 < m.count, jumps < 16 else { return nil }
+                if end == nil { end = o + 2 }
+                o = (len & 0x3F) << 8 | Int(m[o + 1])
+                jumps += 1
+                continue
+            }
+            guard o + 1 + len <= m.count else { return nil }
+            labels.append(String(decoding: m[(o + 1)..<(o + 1 + len)], as: UTF8.self))
+            o += 1 + len
+        }
+        return nil
+    }
+}
+
 // MARK: - SSH banners
 
 enum SSH {
@@ -384,6 +479,10 @@ enum Identify {
         queue.addOperation {
             let names = NetBIOS.names(for: others.map(\.ipKey))
             for (ip, n) in names { update(ip) { $0.netbios = n } }
+        }
+        queue.addOperation {
+            let names = MDNS.names(for: devices.map(\.ipKey))
+            for (ip, n) in names { update(ip) { $0.mdnsName = n } }
         }
         for (ip, answer) in ssdp {
             if let server = answer.server { update(ip) { $0.upnpServer = server } }

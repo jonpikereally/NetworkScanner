@@ -11,7 +11,7 @@ cp Info.plist $APP/Contents/
 cp NetworkScanner.icns $APP/Contents/Resources/
 BUILD=$(git rev-list --count HEAD 2>/dev/null || echo 0)
 /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $BUILD" -c "Add :BuildDate string $(date -u +%Y-%m-%dT%H:%M:%SZ)" $APP/Contents/Info.plist
-swiftc -O -module-cache-path "$CACHE" -parse-as-library NetworkScanner.swift Scanner.swift Identify.swift Updater.swift \
+swiftc -O -module-cache-path "$CACHE" -parse-as-library NetworkScanner.swift Scanner.swift Identify.swift Catalog.swift Updater.swift \
   -o $APP/Contents/MacOS/NetworkScanner
 xattr -cr $APP
 codesign --force --sign - $APP

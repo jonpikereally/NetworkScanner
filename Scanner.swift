@@ -279,6 +279,34 @@ enum ARP {
     }
 }
 
+/// IPv6 neighbours. Pinging the all-nodes multicast address makes every IPv6 device on the
+/// link answer, which fills the NDP cache; `ndp -an` then maps their addresses to MACs.
+enum NDP {
+    static func wake(interface: String) {
+        _ = shell("/sbin/ping6", ["-c", "2", "-q", "ff02::1%\(interface)"])
+    }
+
+    /// MAC → IPv6 addresses on the interface, link-local (fe80::) first.
+    static func table(interface: String) -> [String: [String]] {
+        // "fe80::1c4e:bf04:aa:bb%en0   5a:49:58:56:a3:ac   en0 23h59m58s S R"
+        var out: [String: [String]] = [:]
+        for line in shell("/usr/sbin/ndp", ["-an"]).split(separator: "\n") {
+            let f = line.split(separator: " ", omittingEmptySubsequences: true)
+            guard f.count >= 3, f[2] == interface, let mac = MAC.normalize(String(f[1])) else { continue }
+            let addr = String(f[0].split(separator: "%").first ?? f[0])
+            guard addr.contains(":") else { continue }
+            out[mac, default: []].append(addr)
+        }
+        for (mac, list) in out {
+            out[mac] = list.sorted { a, b in
+                let la = a.hasPrefix("fe80"), lb = b.hasPrefix("fe80")
+                return la != lb ? la : a < b
+            }
+        }
+        return out
+    }
+}
+
 enum DNS {
     static func reverse(_ ip: UInt32) -> String? {
         var sa = IPv4.socketAddress(ip)
@@ -514,7 +542,8 @@ final class VendorDB {
 // MARK: - Scan
 
 struct Device: Identifiable, Hashable {
-    var id: String { ip }
+    /// Unique per row: the IP for devices seen this scan, the remembered key for offline ones.
+    var id: String { isOffline ? "offline:\(knownKey)" : ip }
     let ip: String
     let ipKey: UInt32
     var mac: String?
@@ -534,13 +563,48 @@ struct Device: Identifiable, Hashable {
     var bonjourFacts: [Fact] = []
     var identity = Identity()    // filled in by the identify pass (Identify.swift)
     var deepScanned = false
+    var ipv6: [String] = []
+    var lastSeen = Date()
+    /// Remembered from an earlier scan but not found in this one. The saved* fields hold what
+    /// was known when it was last seen.
+    var isOffline = false
+    var savedName: String?
+    var savedKind: String?
+    var savedMaker: String?
+    var savedModel: String?
 
     var randomizedMAC: Bool { mac.map(MAC.isRandomized) ?? false }
-    var displayName: String {
-        label ?? bonjourName ?? identity.upnp?.friendlyName ?? identity.netbios?.name ?? hostname ?? ""
+
+    /// The name the device announces (or that was given to it), without fallbacks.
+    var realName: String? {
+        label ?? bonjourName ?? identity.upnp?.friendlyName ?? identity.netbios?.name
+            ?? (isOffline ? savedName : nil) ?? hostLabel
     }
-    var maker: String? { vendor ?? identity.upnp?.manufacturer }
-    var modelName: String? { model ?? identity.upnp?.model }
+    /// Hostname without ".local" and with dashes as spaces, e.g. "Jonathans-MacBook-Pro.local" → "Jonathans MacBook Pro".
+    private var hostLabel: String? {
+        guard let h = bestHostname else { return nil }
+        var s = h
+        if s.lowercased().hasSuffix(".local") { s = String(s.dropLast(6)) }
+        guard !s.contains(".") else { return h }
+        return s.replacingOccurrences(of: "-", with: " ")
+    }
+    var bestHostname: String? { hostname ?? identity.mdnsName }
+
+    /// realName, or "<Maker> device" / "Unidentified device" when it doesn't announce one.
+    var displayName: String {
+        if let n = realName, !n.isEmpty { return n }
+        if let m = maker { return "\(Maker.short(m)) device" }
+        return randomizedMAC ? "Private device" : "Unidentified device"
+    }
+    var hasRealName: Bool { !(realName ?? "").isEmpty }
+
+    var maker: String? { vendor ?? identity.upnp?.manufacturer ?? (isOffline ? savedMaker : nil) }
+    /// Marketing name when the identifier is a known Apple model ("iPad8,9" → "iPad Pro 11-inch (2nd gen)").
+    var modelName: String? {
+        if let m = model { return AppleModels.name(m) ?? m }
+        return identity.upnp?.model ?? (isOffline ? savedModel : nil)
+    }
+    var icon: String { DeviceIcon.symbol(for: kind) }
 
     /// Everything learned about the device, grouped by where it came from.
     var facts: [Fact] {
@@ -564,6 +628,7 @@ struct Device: Identifiable, Hashable {
             add("Web", "Server", w.server)
             add("Web", "Address", w.url)
         }
+        add("Bonjour", "Hostname (mDNS)", identity.mdnsName)
         if let n = identity.netbios {
             add("Windows networking", "Computer name", n.name)
             add("Windows networking", "Workgroup", n.workgroup)
@@ -582,11 +647,13 @@ struct Device: Identifiable, Hashable {
     }
 
     // Sort keys for the table
-    var statusRank: Int { isSelf ? 0 : isGateway ? 1 : responded ? 2 : 3 }
-    var sortName: String { displayName.isEmpty ? "\u{FFFF}" : displayName.lowercased() }
+    var statusRank: Int { isOffline ? 4 : isSelf ? 0 : isGateway ? 1 : responded ? 2 : 3 }
+    var sortName: String { (hasRealName ? "0" : "1") + displayName.lowercased() }
     var sortVendor: String { (maker ?? "\u{FFFF}").lowercased() }
     var sortModel: String { (modelName ?? "\u{FFFF}").lowercased() }
     var sortMAC: String { mac ?? "\u{FFFF}" }
+    var sortIPv6: String { ipv6.first ?? "\u{FFFF}" }
+    var sortHost: String { (bestHostname ?? "\u{FFFF}").lowercased() }
     var portCount: Int { openPorts.count }
 
     var portSummary: String {
@@ -603,6 +670,7 @@ struct Device: Identifiable, Hashable {
     /// Best guess at what the device is: Bonjour model and category, UPnP, then services,
     /// ports, maker and what its web page and SSH banner say.
     var kind: String {
+        if isOffline, let k = savedKind { return k }
         if isSelf { return "This Mac" }
         if isGateway { return "Router" }
         if let c = category { return c }
@@ -741,12 +809,14 @@ enum Scanner {
             var names: [UInt32: String] = [:]
             let dns = OperationQueue()
             dns.maxConcurrentOperationCount = 16
+            dns.addOperation { NDP.wake(interface: net.interface) }
             for ip in ips {
                 dns.addOperation {
                     if let n = DNS.reverse(ip) { lock.lock(); names[ip] = n; lock.unlock() }
                 }
             }
             dns.waitUntilAllOperationsAreFinished()
+            let ndp = NDP.table(interface: net.interface)
             ssdpDone.wait()
 
             DispatchQueue.main.async {
@@ -768,6 +838,7 @@ enum Scanner {
                             d.bonjourFacts = b.facts
                         }
                         d.vendor = d.mac.flatMap { VendorDB.shared.lookup($0) }
+                        d.ipv6 = d.mac.flatMap { ndp[$0] } ?? []
                         devices.append(d)
                     }
                     progress(0.85, "Identifying \(devices.count) devices\u{2026}")

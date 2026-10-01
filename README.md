@@ -1,16 +1,18 @@
 # Network Scanner
 
-A small Mac app that shows what's on your local network: every device's IP address, name, type, maker, model, MAC address and open ports. Devices that weren't there last time are marked **NEW**. It's four Swift files with no Xcode project and no dependencies, and it doesn't need admin rights.
+A small Mac app that shows what's on your local network: every device's icon, IP and IPv6 addresses, name, type, maker, model, MAC address, hostname, open ports and when it was last seen. Devices that weren't there last time are marked **NEW**. It's five Swift files with no Xcode project and no dependencies, and it doesn't need admin rights.
 
 ## Using it
 
 - **Open it** like any app. It scans as soon as it opens; **Scan → Scan Now** (⌘R) rescans. Closing the window quits it.
-- **The window** shows your network and device count at the top and lists everything found. Click a column to sort, type in Filter to search, and **Copy List** puts the table on the clipboard (tab separated, pastes into a spreadsheet).
+- **The window** shows your network at the top, lists everything found, and has a status bar with device counts and the countdown to the next automatic scan. Right-click a column header to show or hide columns (Open Ports is hidden by default). Click a column to sort, type in Filter to search, and **Copy List** puts the table on the clipboard (tab separated, pastes into a spreadsheet).
 - **Select a device** to see everything known about it in the details pane on the right: what it announces over UPnP and Bonjour, its web page title, Windows computer name, SSH banner, and every open port. **Copy Details** puts it all on the clipboard.
 - **Deep Scan** (in the details pane or the right-click menu) checks about 1,100 ports on one device instead of the usual 26 and takes a few seconds. Ports it finds are kept for the rest of the session.
 - **Double-click a device** to give it a name. Names are remembered by MAC address. Right-click for Copy IP/MAC and **Open in Browser** for devices with a web page (routers, printers, NAS).
 - A **green dot** means the device answered this scan. A **grey dot** means it's in the Mac's ARP cache but didn't answer: usually a sleeping phone, or something that left in the last few minutes.
-- The **Scan** menu has **Rescan Every 10 Minutes** (on by default, while the app is open), **Look Up Device Makers** and **Forget Remembered Devices…**, which clears names and NEW tracking.
+- **Offline devices**: devices seen in the last 30 days but not found now stay in the list, greyed out with their **Last Seen** time (turn off with **Scan → Show Offline Devices**).
+- Devices that don't announce a name are shown as *Maker device* (e.g. "Nintendo device"), or *Private device* when they use a private Wi-Fi address.
+- The **Scan** menu has **Scan Automatically** (off, or every 1, 5, 10 or 30 minutes; 5 by default, while the app is open), **Show Offline Devices**, **Look Up Device Makers** and **Forget Remembered Devices…**, which clears names and NEW tracking.
 
 ## How it finds devices
 
@@ -24,7 +26,10 @@ A small Mac app that shows what's on your local network: every device's IP addre
    - **Web**: the page title and `Server` header of devices with a web page (e.g. "ASUS RT-AX86U", "Synology DiskStation").
    - **Windows networking**: a NetBIOS name query returns Windows PCs' and Samba NAS boxes' computer names and workgroups.
    - **SSH**: the banner on port 22 names the server software and often the OS (e.g. Ubuntu, Raspbian).
-6. **Type** is a best guess from all of the above (Bonjour model and category and UPnP first, then services, open ports, maker, and web/SSH hints).
+   - **mDNS hostname**: a direct PTR query to each device's port 5353 returns its `name.local`.
+6. **IPv6**: a ping to the all-nodes multicast address fills the NDP cache, and `ndp -an` maps each device's IPv6 addresses to its MAC.
+7. **Model names**: Apple model identifiers (`iPad8,9`) are shown as marketing names ("iPad Pro 11-inch (2nd gen)").
+8. **Type** is a best guess from all of the above (Bonjour model and category and UPnP first, then services, open ports, maker, and web/SSH hints).
 
 A scan of a /24 takes about 10–15 seconds, including the identify pass.
 
