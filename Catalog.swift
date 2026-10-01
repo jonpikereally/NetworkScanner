@@ -114,7 +114,8 @@ enum DeviceIcon {
         let k = kind.lowercased()
         let table: [(String, String)] = [
             ("this mac", "laptopcomputer"), ("mac laptop", "laptopcomputer"), ("mac", "desktopcomputer"),
-            ("router", "wifi.router"), ("network device", "network"), ("range extender", "wifi"),
+            ("router", "wifi.router"), ("network device", "network"), ("range extender", "wifi"), ("access point", "wifi"),
+            ("android", "candybarphone"),
             ("iphone", "iphone"), ("ipad", "ipad"), ("apple watch", "applewatch"), ("apple tv", "appletv"),
             ("homepod", "homepod"), ("chromecast", "tv"), ("tv box", "appletv"), ("streaming", "tv"), ("tv", "tv"),
             ("media player", "play.tv"), ("roku", "play.tv"), ("media server", "externaldrive.connected.to.line.below"),
