@@ -72,7 +72,7 @@ USE
 PRIVACY
 Scans stay on your network. Network Scanner fetches two things from the internet: a small
 version file from the GitHub repo above (to see whether an update exists), and, unless you
-turn off "Look Up Device Makers", the public MAC maker list from wireshark.org once a month.
+turn off "Look Up Device Makers", the public IEEE MAC maker list (via GitHub) once a month.
 README
 
 mkdir -p updates

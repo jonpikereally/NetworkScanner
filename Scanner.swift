@@ -8,7 +8,7 @@ import SystemConfiguration
 //   2. The ARP cache then lists everything that answered ARP, including phones and IoT devices
 //      that ignore TCP entirely, with their MAC addresses.
 //   3. Bonjour (mDNS) browsing and reverse DNS supply names, models and services.
-//   4. The MAC's first bytes give the maker, from Wireshark's public OUI list (optional).
+//   4. The MAC's first bytes give the maker, from the public IEEE OUI list (optional).
 //   Then Identify.swift asks each device for more (UPnP, web page, NetBIOS, SSH).
 
 // MARK: - Address helpers
@@ -80,6 +80,9 @@ struct NetworkInfo {
     let netmask: UInt32
     let mac: String?
     let gateway: UInt32?
+    /// Every IPv4 address this Mac has on any interface (Wi-Fi and Ethernet both on the same
+    /// network, say), with that interface's MAC.
+    var localAddresses: [UInt32: String] = [:]
 
     var prefix: Int { netmask.nonzeroBitCount }
     var network: UInt32 { address & netmask }
@@ -149,8 +152,10 @@ struct NetworkInfo {
         guard let name = chosen, let pair = v4[name] else { return nil }
         let (addr, mask) = pair
         let gw = gateway.flatMap { (addr & mask) == ($0 & mask) ? $0 : nil }
-        return NetworkInfo(interface: name, interfaceName: displayName(bsd: name) ?? name,
-                           address: addr, netmask: mask, mac: macs[name], gateway: gw)
+        var info = NetworkInfo(interface: name, interfaceName: displayName(bsd: name) ?? name,
+                               address: addr, netmask: mask, mac: macs[name], gateway: gw)
+        for (ifname, (a, _)) in v4 { info.localAddresses[a] = macs[ifname] ?? "" }
+        return info
     }
 
     private static func displayName(bsd: String) -> String? {
@@ -348,7 +353,7 @@ struct BonjourHost {
         func t(_ key: String) -> String? { txt[key].flatMap { $0.isEmpty ? nil : $0 } }
         types.insert(type)
         if type.hasPrefix("_device-info") {
-            if let m = t("model") { model = model ?? m; add("Model", m) }
+            if let m = t("model"), !Self.isSpoofModel(m) { model = model ?? m; add("Model", m) }
             return
         }
         var name = instance
@@ -356,15 +361,17 @@ struct BonjourHost {
         if type.hasPrefix("_googlecast"), let fn = t("fn") { name = fn }
         if type.hasPrefix("_sleep-proxy"), let sp = name.firstIndex(of: " ") { name = String(name[name.index(after: sp)...]) }
         let priority = BonjourBrowser.types.firstIndex { type.hasPrefix($0) } ?? BonjourBrowser.types.count
-        if priority < namePriority, !Self.looksLikeID(name) { self.name = name; namePriority = priority }
+        if priority < namePriority, !Self.looksLikeID(name), !Self.isGeneric(name) { self.name = name; namePriority = priority }
 
         let isPrinter = ["_ipp", "_ipps", "_printer", "_pdl-datastream"].contains { type.hasPrefix($0) }
         let m = isPrinter ? (t("ty") ?? t("product").map { $0.trimmingCharacters(in: CharacterSet(charactersIn: "()")) })
             : type.hasPrefix("_raop") ? t("am")
             : type.hasPrefix("_companion-link") ? t("rpMd")
             : t("model") ?? t("md")
-        if model == nil { model = m }
-        add("Model", m)
+        if let m, !Self.isSpoofModel(m) {
+            if model == nil { model = m }
+            add("Model", m)
+        }
         if isPrinter {
             category = "Printer"
             add("Printer location", t("note"))
@@ -397,7 +404,21 @@ struct BonjourHost {
     /// Service names that are serial numbers or UUIDs rather than something a person chose.
     static func looksLikeID(_ s: String) -> Bool {
         let hex = s.filter { $0.isHexDigit }.count
-        return s.count >= 12 && hex >= s.count - s.filter { $0 == "-" || $0 == ":" }.count
+        if s.count >= 12 && hex >= s.count - s.filter { $0 == "-" || $0 == ":" }.count { return true }
+        // "f4:e8:c7:ca:41:9f@fe80::f6e8:…-supportsRP-24" (_apple-mobdev2) and other MAC-prefixed names
+        if s.contains("@fe80") || s.range(of: "^[0-9A-Fa-f]{2}([:-][0-9A-Fa-f]{2}){5}", options: .regularExpression) != nil { return true }
+        return false
+    }
+
+    /// Placeholder names many devices announce instead of a real one.
+    static func isGeneric(_ s: String) -> Bool {
+        let l = s.lowercased().replacingOccurrences(of: " ", with: "")
+        return ["spotifyconnect", "android", "localhost", "espressif", "esp32", "esp8266", "unknown", "device", "linux"].contains(l)
+    }
+
+    /// Models some NAS boxes and Samba servers announce so Finder shows a server icon.
+    static func isSpoofModel(_ s: String) -> Bool {
+        ["xserve", "rackmac", "macsamba", "powermac", "timecapsule"].contains { s.lowercased().hasPrefix($0) }
     }
 }
 
@@ -476,7 +497,7 @@ final class BonjourBrowser: NSObject, NetServiceBrowserDelegate, NetServiceDeleg
         var txt: [String: String] = [:]
         for (k, v) in raw { txt[k] = String(data: v, encoding: .utf8) }
         if type.hasPrefix("_device-info") {
-            if let m = txt["model"], !m.isEmpty { modelsByName[s.name] = m }
+            if let m = txt["model"], !m.isEmpty, !BonjourHost.isSpoofModel(m) { modelsByName[s.name] = m }
             return
         }
         for addr in s.addresses ?? [] {
@@ -489,11 +510,16 @@ final class BonjourBrowser: NSObject, NetServiceBrowserDelegate, NetServiceDeleg
     }
 }
 
-// MARK: - Maker lookup (IEEE OUI via Wireshark's manuf list)
+// MARK: - Maker lookup (IEEE OUI registry, via Nmap's or Wireshark's copy)
 
 final class VendorDB {
     static let shared = VendorDB()
-    static let source = URL(string: "https://www.wireshark.org/download/automated/data/manuf")!
+    /// The IEEE registry as the Nmap project publishes it (kept current, ~52,000 entries), then
+    /// Wireshark's copy as a fallback. Either format is understood.
+    static let sources = [
+        URL(string: "https://raw.githubusercontent.com/nmap/nmap/master/nmap-mac-prefixes")!,
+        URL(string: "https://www.wireshark.org/download/automated/data/manuf")!,
+    ]
 
     private let lock = NSLock()
     private var tables: [Int: [UInt64: String]] = [:]   // prefix length in bits → prefix → maker
@@ -510,7 +536,7 @@ final class VendorDB {
         let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("NetworkScanner", isDirectory: true)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        return dir.appendingPathComponent("manuf.txt")
+        return dir.appendingPathComponent("oui.txt")
     }
 
     /// Loads the cached list, downloading it if missing or older than 30 days.
@@ -519,42 +545,56 @@ final class VendorDB {
         guard enabled, !loading else { return }
         loading = true
         DispatchQueue.global(qos: .utility).async { [self] in
+            defer { loading = false }
             let attrs = try? FileManager.default.attributesOfItem(atPath: file.path)
             let age = (attrs?[.modificationDate] as? Date).map { -$0.timeIntervalSinceNow } ?? .infinity
-            if !isLoaded, let text = try? String(contentsOf: file, encoding: .utf8) {
-                load(text)
+            if !isLoaded, let text = try? String(contentsOf: file, encoding: .utf8), let t = Self.parse(text) {
+                lock.lock(); tables = t; lock.unlock()
                 DispatchQueue.main.async(execute: completion)
             }
-            guard age > 30 * 86400 else { loading = false; return }
-            var req = URLRequest(url: Self.source, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 60)
-            req.setValue("NetworkScanner/\(AppVersion.version)", forHTTPHeaderField: "User-Agent")
-            URLSession.shared.dataTask(with: req) { data, response, _ in
-                defer { self.loading = false }
-                guard let data, (response as? HTTPURLResponse)?.statusCode == 200,
-                      let text = String(data: data, encoding: .utf8), text.contains("\t") else { return }
-                try? data.write(to: self.file, options: .atomic)
-                self.load(text)
+            guard age > 30 * 86400 else { return }
+            for source in Self.sources {
+                var req = URLRequest(url: source, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 60)
+                req.setValue("NetworkScanner/\(AppVersion.version)", forHTTPHeaderField: "User-Agent")
+                guard let res = HTTP.fetch(req), res.1.statusCode == 200,
+                      let text = String(data: res.0, encoding: .utf8), let t = Self.parse(text) else { continue }
+                try? res.0.write(to: file, options: .atomic)
+                lock.lock(); tables = t; lock.unlock()
                 DispatchQueue.main.async(execute: completion)
-            }.resume()
+                return
+            }
         }
     }
 
-    /// Lines look like "00:00:0C<TAB>Cisco<TAB>Cisco Systems, Inc" or, for smaller blocks,
-    /// "00:1B:C5:00:00:00/36<TAB>Short<TAB>Long name".
-    private func load(_ text: String) {
+    /// Understands both list formats:
+    ///   Nmap:      "001132 Synology Incorporated"  (6, 7 or 9 hex digits = 24/28/36-bit prefix)
+    ///   Wireshark: "00:11:32<TAB>Synology<TAB>Synology Incorporated", "00:1B:C5:00:00:00/36<TAB>…"
+    /// Returns nil unless it looks like a real list (a download error page, say).
+    static func parse(_ text: String) -> [Int: [UInt64: String]]? {
         var t: [Int: [UInt64: String]] = [:]
+        var count = 0
         for line in text.split(separator: "\n") where !line.hasPrefix("#") {
-            let f = line.split(separator: "\t", omittingEmptySubsequences: false)
-            guard f.count >= 2 else { continue }
-            let spec = f[0].split(separator: "/")
-            let hex = spec[0].replacingOccurrences(of: ":", with: "").replacingOccurrences(of: "-", with: "")
-            let bits = spec.count > 1 ? Int(spec[1]) ?? 24 : hex.count * 4
-            guard bits % 4 == 0, bits <= hex.count * 4, let value = UInt64(hex.prefix(bits / 4), radix: 16) else { continue }
-            let long = f.count > 2 ? f[2].trimmingCharacters(in: .whitespaces) : ""
-            let name = long.isEmpty ? f[1].trimmingCharacters(in: .whitespaces) : long
+            var hex = "", bits = 0, name = ""
+            if line.contains("\t") {
+                let f = line.split(separator: "\t", omittingEmptySubsequences: false)
+                guard f.count >= 2 else { continue }
+                let spec = f[0].split(separator: "/")
+                hex = spec[0].replacingOccurrences(of: ":", with: "").replacingOccurrences(of: "-", with: "")
+                bits = spec.count > 1 ? Int(spec[1]) ?? 24 : hex.count * 4
+                let long = f.count > 2 ? f[2].trimmingCharacters(in: .whitespaces) : ""
+                name = long.isEmpty ? f[1].trimmingCharacters(in: .whitespaces) : long
+            } else {
+                guard let sp = line.firstIndex(of: " ") else { continue }
+                hex = String(line[..<sp])
+                bits = hex.count * 4
+                name = line[line.index(after: sp)...].trimmingCharacters(in: .whitespaces)
+            }
+            guard bits % 4 == 0, bits >= 24, bits <= hex.count * 4, !name.isEmpty,
+                  let value = UInt64(hex.prefix(bits / 4), radix: 16) else { continue }
             t[bits, default: [:]][value] = name
+            count += 1
         }
-        lock.lock(); tables = t; lock.unlock()
+        return count > 1000 ? t : nil
     }
 
     func lookup(_ mac: String) -> String? {
@@ -614,6 +654,7 @@ struct Device: Identifiable, Hashable {
         guard let h = bestHostname else { return nil }
         var s = h
         if s.lowercased().hasSuffix(".local") { s = String(s.dropLast(6)) }
+        guard !BonjourHost.isGeneric(s), !BonjourHost.looksLikeID(s) else { return nil }
         guard !s.contains(".") else { return h }
         return s.replacingOccurrences(of: "-", with: " ")
     }
@@ -627,7 +668,20 @@ struct Device: Identifiable, Hashable {
     }
     var hasRealName: Bool { !(realName ?? "").isEmpty }
 
-    var maker: String? { vendor ?? identity.upnp?.manufacturer ?? savedMaker }
+    /// What the device says about itself (UPnP) first, then the MAC's registered maker, then
+    /// "Apple" for Apple devices using private Wi-Fi addresses, then what was known before.
+    var maker: String? { identity.upnp?.manufacturer ?? vendor ?? (looksApple ? "Apple" : nil) ?? savedMaker }
+
+    /// Apple-only signals: an Apple model identifier, Apple-only services, the iOS sync port,
+    /// or an Apple-style hostname.
+    var looksApple: Bool {
+        if let m = model?.lowercased(),
+           ["iphone", "ipad", "mac", "imac", "appletv", "audioaccessory", "watch"].contains(where: { m.hasPrefix($0) }) { return true }
+        let s = Set(services.map { $0.components(separatedBy: ".").first ?? $0 })
+        if s.contains("_companion-link") || s.contains("_apple-mobdev2") || openPorts.contains(62078) { return true }
+        let h = (bestHostname ?? "").lowercased()
+        return ["iphone", "ipad", "macbook", "imac", "mac-mini", "mac-studio"].contains { h.contains($0) }
+    }
     /// Marketing name when the identifier is a known Apple model ("iPad8,9" → "iPad Pro 11-inch (2nd gen)").
     var modelName: String? {
         if let m = model { return AppleModels.name(m) ?? m }
@@ -743,7 +797,15 @@ struct Device: Identifiable, Hashable {
         }
         if hints.contains("synology") || hints.contains("diskstation") || hints.contains("qnap") || hints.contains("truenas") { return "NAS" }
         if hints.contains("openwrt") || hints.contains("routeros") || hints.contains("unifi") || hints.contains("dd-wrt") { return "Network device" }
+        let host = (bestHostname ?? "").lowercased()
+        if host.contains("iphone") { return "iPhone" }
+        if host.contains("ipad") { return "iPad" }
+        if host.contains("macbook") { return "Mac laptop" }
+        if host.contains("imac") || host.contains("mac-mini") || host.contains("mac-studio") { return "Mac" }
+        if ["synology", "qnap", "western digital", "buffalo", "asustor", "terramaster"].contains(where: { v.contains($0) }) { return "NAS" }
+        if s.contains("_googlecast") && (s.contains("_raop") || s.contains("_spotify-connect")) { return "Speaker / soundbar" }
         if s.contains("_googlecast") { return "Chromecast / Google TV" }
+        if ["harman", "jbl", "bose", "bang & olufsen", "denon", "marantz", "yamaha"].contains(where: { v.contains($0) }) { return "Speaker" }
         if s.contains("_sonos") || p.contains(1400) || v.contains("sonos") { return "Sonos speaker" }
         if !s.isDisjoint(with: ["_ipp", "_ipps", "_printer", "_pdl-datastream"]) || p.contains(9100) || p.contains(631) { return "Printer" }
         if !s.isDisjoint(with: ["_uscan", "_scanner"]) { return "Scanner" }
@@ -753,6 +815,7 @@ struct Device: Identifiable, Hashable {
         if s.contains("_hap") || s.contains("_homekit") || s.contains("_matter") || s.contains("_hue") { return "Smart home device" }
         if p.contains(62078) || s.contains("_apple-mobdev2") { return "iPhone / iPad" }
         if s.contains("_companion-link") { return "Apple device" }
+        if host.contains("android") || host.contains("galaxy") || host.contains("pixel") { return "Android device" }
         if s.contains("_spotify-connect") { return "Speaker" }
         if v.contains("raspberry") { return "Raspberry Pi" }
         if v.contains("nintendo") || v.contains("sony interactive") || v.contains("microsoft") && p.isEmpty { return "Game console" }
@@ -765,6 +828,8 @@ struct Device: Identifiable, Hashable {
         if s.contains("_rfb") || s.contains("_ssh") || s.contains("_sftp-ssh") || p.contains(22) || p.contains(3389) { return "Computer" }
         if v.contains("apple") { return "Apple device" }
         if v.contains("samsung") || v.contains("lg electronics") || v.contains("vizio") || v.contains("tcl") || v.contains("hisense") { return "TV / appliance" }
+        if ["tp-link", "eero", "netgear", "ubiquiti", "linksys", "asustek", "plume", "google fiber"].contains(where: { v.contains($0) }),
+           p.contains(80) || p.contains(443) { return "Wi-Fi access point" }
         if p.contains(80) || p.contains(443) || p.contains(8080) { return "Web-managed device" }
         if randomizedMAC { return "Phone / laptop" }
         return "Unknown"
@@ -871,9 +936,9 @@ enum Scanner {
                     var devices: [Device] = []
                     for ip in ips {
                         var d = Device(ip: IPv4.string(ip), ipKey: ip)
-                        d.isSelf = ip == net.address
+                        d.isSelf = net.localAddresses[ip] != nil
                         d.isGateway = ip == net.gateway
-                        d.mac = d.isSelf ? net.mac : arp[ip]
+                        if let m = net.localAddresses[ip] { d.mac = m.isEmpty ? nil : m } else { d.mac = arp[ip] }
                         d.hostname = names[ip]
                         d.openPorts = alive[ip] ?? []
                         d.responded = d.isSelf || alive[ip] != nil
