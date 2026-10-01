@@ -43,6 +43,10 @@ final class ScanStore: ObservableObject {
     @Published var nothingAnswered = false
     /// Newer version waiting on GitHub, shown as a button in the window.
     @Published var updateVersion: String?
+    /// Deep scans in progress: device ID → progress 0…1.
+    @Published var deepScans: [String: Double] = [:]
+    /// Ports found by deep scans this session, keyed like KnownDevices, so rescans keep them.
+    private var deepPorts: [String: [UInt16]] = [:]
     var onChange: () -> Void = {}
     var onInstallUpdate: () -> Void = {}
 
@@ -75,6 +79,10 @@ final class ScanStore: ObservableObject {
         let now = Date()
         devices = outcome.devices.map { d in
             var d = d
+            if let extra = deepPorts[d.knownKey] {
+                d.openPorts = Array(Set(d.openPorts).union(extra)).sorted()
+                d.deepScanned = true
+            }
             if var k = known[d.knownKey] {
                 k.lastSeen = now
                 d.label = k.label
@@ -104,6 +112,31 @@ final class ScanStore: ObservableObject {
         KnownDevices.save(known)
         if let i = devices.firstIndex(where: { $0.id == device.id }) { devices[i].label = value }
         onChange()
+    }
+
+    /// Probes ~1,100 ports on one device, then re-runs the web and SSH checks.
+    func deepScan(_ device: Device) {
+        let id = device.id
+        guard deepScans[id] == nil else { return }
+        deepScans[id] = 0
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let open = DeepScan.run(device.ipKey) { p in self?.deepScans[id] = p }
+            var d = device
+            d.openPorts = Array(Set(d.openPorts).union(open)).sorted()
+            d.deepScanned = true
+            d = Identify.refresh(d)
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.deepScans[id] = nil
+                self.deepPorts[d.knownKey] = d.openPorts
+                if let i = self.devices.firstIndex(where: { $0.id == id }) {
+                    let label = self.devices[i].label
+                    self.devices[i] = d
+                    self.devices[i].label = label
+                }
+                self.onChange()
+            }
+        }
     }
 
     /// Re-applies makers once the OUI list has loaded (it may arrive after the first scan).
@@ -136,9 +169,9 @@ final class ScanStore: ObservableObject {
     }
 
     func text(of rows: [Device]) -> String {
-        var lines = ["IP Address\tName\tType\tMaker\tMAC Address\tOpen Ports\tServices"]
+        var lines = ["IP Address\tName\tType\tMaker\tModel\tMAC Address\tOpen Ports\tServices"]
         for d in rows {
-            lines.append([d.ip, d.displayName, d.kind, d.vendor ?? "", d.mac ?? "", d.portSummary, d.serviceSummary]
+            lines.append([d.ip, d.displayName, d.kind, d.maker ?? "", d.modelName ?? "", d.mac ?? "", d.portSummary, d.serviceSummary]
                 .joined(separator: "\t"))
         }
         return lines.joined(separator: "\n")
@@ -156,7 +189,7 @@ struct DevicesView: View {
     private var rows: [Device] {
         let q = filter.trimmingCharacters(in: .whitespaces).lowercased()
         let shown = q.isEmpty ? store.devices : store.devices.filter { d in
-            [d.ip, d.displayName, d.kind, d.vendor ?? "", d.mac ?? "", d.hostname ?? "", d.serviceSummary]
+            [d.ip, d.displayName, d.kind, d.maker ?? "", d.modelName ?? "", d.mac ?? "", d.hostname ?? "", d.serviceSummary]
                 .contains { $0.lowercased().contains(q) }
         }
         return shown.sorted(using: sortOrder)
@@ -167,9 +200,15 @@ struct DevicesView: View {
             header
             Divider()
             if store.nothingAnswered && !store.scanning { localNetworkHint }
-            table
+            HSplitView {
+                table.frame(minWidth: 560)
+                if let d = device(selection) {
+                    DeviceDetailView(device: d, store: store) { rename(d) }
+                        .frame(minWidth: 280, idealWidth: 330, maxWidth: 480)
+                }
+            }
         }
-        .frame(minWidth: 820, minHeight: 360)
+        .frame(minWidth: 900, minHeight: 400)
     }
 
     private var header: some View {
@@ -248,15 +287,20 @@ struct DevicesView: View {
             }
             .width(min: 140, ideal: 200)
             TableColumn("Type", value: \.kind) { d in
-                Text(d.kind).help(d.model.map { "Model: \($0)" } ?? "")
+                Text(d.kind)
             }
             .width(min: 100, ideal: 150)
             TableColumn("Maker", value: \.sortVendor) { d in
-                Text(d.vendor ?? (d.randomizedMAC ? "Private address" : "\u{2014}"))
-                    .foregroundStyle(d.vendor == nil ? Color.secondary : Color.primary)
-                    .help(d.randomizedMAC ? "This device uses a private (randomized) Wi-Fi address, so its maker can't be looked up." : "")
+                Text(d.maker ?? (d.randomizedMAC ? "Private address" : "\u{2014}"))
+                    .foregroundStyle(d.maker == nil ? Color.secondary : Color.primary)
+                    .help(d.randomizedMAC && d.maker == nil ? "This device uses a private (randomized) Wi-Fi address, so its maker can't be looked up." : "")
             }
-            .width(min: 100, ideal: 160)
+            .width(min: 100, ideal: 150)
+            TableColumn("Model", value: \.sortModel) { d in
+                Text(d.modelName ?? "\u{2014}")
+                    .foregroundStyle(d.modelName == nil ? Color.secondary : Color.primary)
+            }
+            .width(min: 90, ideal: 150)
             TableColumn("MAC Address", value: \.sortMAC) { d in
                 Text(d.mac ?? "\u{2014}").font(.system(.body, design: .monospaced))
             }
@@ -272,6 +316,9 @@ struct DevicesView: View {
             if let d = device(ids) {
                 Button("Rename\u{2026}") { rename(d) }
                 if d.label != nil { Button("Clear Name") { store.rename(d, to: nil) } }
+                Divider()
+                Button(d.deepScanned ? "Deep Scan Again" : "Deep Scan") { store.deepScan(d) }
+                    .disabled(store.deepScans[d.id] != nil)
                 Divider()
                 Button("Copy IP Address") { copy(d.ip) }
                 if let mac = d.mac { Button("Copy MAC Address") { copy(mac) } }
@@ -313,6 +360,133 @@ struct DevicesView: View {
         alert.window.initialFirstResponder = field
         guard alert.runModal() == .alertFirstButtonReturn else { return }
         store.rename(d, to: field.stringValue)
+    }
+}
+
+// MARK: - Details pane
+
+/// Everything known about the selected device, with a Deep Scan button.
+struct DeviceDetailView: View {
+    let device: Device
+    @ObservedObject var store: ScanStore
+    let onRename: () -> Void
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 16) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(device.displayName.isEmpty ? device.ip : device.displayName)
+                        .font(.title3.bold())
+                        .textSelection(.enabled)
+                    Text(device.kind).foregroundStyle(.secondary)
+                }
+                HStack {
+                    Button("Rename\u{2026}", action: onRename)
+                    if let url = device.webURL {
+                        Button("Open Web Page") { NSWorkspace.shared.open(url) }
+                    }
+                    Button("Copy Details") {
+                        NSPasteboard.general.clearContents()
+                        NSPasteboard.general.setString(detailsText, forType: .string)
+                    }
+                }
+                section("Device", rows: basics)
+                ForEach(groups, id: \.0) { group in
+                    section(group.0, rows: group.1.map { ($0.label, $0.value) })
+                }
+                ports
+                if !device.serviceSummary.isEmpty {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("Bonjour services").font(.headline)
+                        Text(device.serviceSummary).textSelection(.enabled)
+                    }
+                }
+            }
+            .padding(14)
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+
+    private var basics: [(String, String)] {
+        var rows = [("IP address", device.ip)]
+        if let mac = device.mac { rows.append(("MAC address", mac + (device.randomizedMAC ? " (private)" : ""))) }
+        if let m = device.maker { rows.append(("Maker", m)) }
+        if let m = device.modelName { rows.append(("Model", m)) }
+        if let h = device.hostname { rows.append(("Hostname", h)) }
+        rows.append(("Status", device.responded ? "Answered this scan" : "In ARP cache only (asleep or just left)"))
+        rows.append(("First seen", device.firstSeen.formatted(date: .abbreviated, time: .shortened)))
+        return rows
+    }
+
+    /// Facts grouped by source, in the order the sources first appear.
+    private var groups: [(String, [Fact])] {
+        var order: [String] = []
+        var bySource: [String: [Fact]] = [:]
+        for f in device.facts {
+            if bySource[f.source] == nil { order.append(f.source) }
+            bySource[f.source, default: []].append(f)
+        }
+        return order.map { ($0, bySource[$0] ?? []) }
+    }
+
+    private var ports: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Text("Open ports").font(.headline)
+                Spacer()
+                if let p = store.deepScans[device.id] {
+                    ProgressView(value: p).frame(width: 90)
+                    Text("Deep scanning\u{2026}").font(.caption).foregroundStyle(.secondary)
+                } else {
+                    Button(device.deepScanned ? "Deep Scan Again" : "Deep Scan") { store.deepScan(device) }
+                        .help("Checks about 1,100 ports instead of the usual 26. Takes a few seconds.")
+                }
+            }
+            if device.openPorts.isEmpty {
+                Text(device.deepScanned ? "None found." : "None of the common ports are open. Try Deep Scan.")
+                    .foregroundStyle(.secondary)
+            } else {
+                Grid(alignment: .leadingFirstTextBaseline, horizontalSpacing: 10, verticalSpacing: 3) {
+                    ForEach(device.openPorts, id: \.self) { p in
+                        GridRow {
+                            Text("\(p)").monospacedDigit().gridColumnAlignment(.trailing)
+                            Text(Probe.name(p) ?? "").foregroundStyle(.secondary)
+                        }
+                    }
+                }
+                if !device.deepScanned {
+                    Text("Common ports only. Deep Scan checks about 1,100.").font(.caption).foregroundStyle(.secondary)
+                }
+            }
+        }
+    }
+
+    private func section(_ title: String, rows: [(String, String)]) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(title).font(.headline)
+            Grid(alignment: .leadingFirstTextBaseline, horizontalSpacing: 10, verticalSpacing: 4) {
+                ForEach(Array(rows.enumerated()), id: \.offset) { _, row in
+                    GridRow {
+                        Text(row.0).foregroundStyle(.secondary).gridColumnAlignment(.trailing)
+                        Text(row.1).textSelection(.enabled)
+                    }
+                }
+            }
+        }
+    }
+
+    private var detailsText: String {
+        var lines = ["\(device.displayName.isEmpty ? device.ip : device.displayName) (\(device.kind))"]
+        lines += basics.map { "\($0.0): \($0.1)" }
+        for (source, facts) in groups {
+            lines.append("")
+            lines.append(source)
+            lines += facts.map { "\($0.label): \($0.value)" }
+        }
+        lines.append("")
+        lines.append("Open ports: " + (device.portSummary.isEmpty ? "none" : device.portSummary))
+        if !device.serviceSummary.isEmpty { lines.append("Bonjour services: " + device.serviceSummary) }
+        return lines.joined(separator: "\n")
     }
 }
 

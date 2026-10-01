@@ -9,7 +9,7 @@ cd "$(dirname "$0")"
 VERSION=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' Info.plist)
 BUILD=$(git rev-list --count HEAD 2>/dev/null || echo 0)
 CACHE="${TMPDIR:-/tmp}/networkscanner-modcache"
-SOURCES=(NetworkScanner.swift Scanner.swift Updater.swift)
+SOURCES=(NetworkScanner.swift Scanner.swift Identify.swift Updater.swift)
 mkdir -p "$CACHE" "$CACHE-x86"
 echo "Building arm64…"
 swiftc -O -target arm64-apple-macos14 -module-cache-path "$CACHE" \
@@ -59,6 +59,7 @@ INSTALL
 
 USE
 • Open Network Scanner from Applications. It scans when it opens; ⌘R rescans.
+• Select a device to see its details; Deep Scan checks about 1,100 ports on it.
 • Devices new since the last scan are marked NEW. Double-click a device to name it.
 • Right-click a device to copy its address or open its web page.
 
