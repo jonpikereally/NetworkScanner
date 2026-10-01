@@ -1,0 +1,6 @@
+NetworkScanner.app/
+mkicon
+icon_*.png
+*.iconset/
+updates/*.tmp
+.DS_Store
