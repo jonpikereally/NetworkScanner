@@ -1,11 +1,13 @@
 # Network Scanner
 
-A small Mac app that shows what's on your local network: every device's IP address, name, type, maker, MAC address and open ports. Devices that weren't there last time are marked **NEW**. It's three Swift files with no Xcode project and no dependencies, and it doesn't need admin rights.
+A small Mac app that shows what's on your local network: every device's IP address, name, type, maker, model, MAC address and open ports. Devices that weren't there last time are marked **NEW**. It's four Swift files with no Xcode project and no dependencies, and it doesn't need admin rights.
 
 ## Using it
 
 - **Open it** like any app. It scans as soon as it opens; **Scan → Scan Now** (⌘R) rescans. Closing the window quits it.
 - **The window** shows your network and device count at the top and lists everything found. Click a column to sort, type in Filter to search, and **Copy List** puts the table on the clipboard (tab separated, pastes into a spreadsheet).
+- **Select a device** to see everything known about it in the details pane on the right: what it announces over UPnP and Bonjour, its web page title, Windows computer name, SSH banner, and every open port. **Copy Details** puts it all on the clipboard.
+- **Deep Scan** (in the details pane or the right-click menu) checks about 1,100 ports on one device instead of the usual 26 and takes a few seconds. Ports it finds are kept for the rest of the session.
 - **Double-click a device** to give it a name. Names are remembered by MAC address. Right-click for Copy IP/MAC and **Open in Browser** for devices with a web page (routers, printers, NAS).
 - A **green dot** means the device answered this scan. A **grey dot** means it's in the Mac's ARP cache but didn't answer: usually a sleeping phone, or something that left in the last few minutes.
 - The **Scan** menu has **Rescan Every 10 Minutes** (on by default, while the app is open), **Look Up Device Makers** and **Forget Remembered Devices…**, which clears names and NEW tracking.
@@ -16,9 +18,15 @@ A small Mac app that shows what's on your local network: every device's IP addre
 2. **ARP cache**: the probes make macOS ARP every address, so `arp -an` afterwards lists devices that ignore TCP entirely (most phones, smart plugs) along with their MAC addresses.
 3. **Names**: Bonjour browsing (AirPlay, Chromecast, HomeKit, printers, file sharing and ~25 other types) gives friendly names like "Living Room" and models like `AppleTV14,1`; reverse DNS fills in the rest.
 4. **Makers**: the first half of the MAC address, looked up in Wireshark's copy of the IEEE OUI list. Phones and laptops using a *private Wi-Fi address* show "Private address" instead, since those MACs are random.
-5. **Type** is a best guess from all of the above (Bonjour model and services first, then open ports, then maker).
+5. **Identify pass**, after each scan:
+   - **UPnP**: one multicast search; TVs, routers, Sonos, consoles, NAS and smart hubs answer with a description giving their friendly name, manufacturer, model and often firmware.
+   - **Bonjour details**: printer model and location, HomeKit category (light, plug, thermostat…), Chromecast model and what's playing, AirPlay model and OS version.
+   - **Web**: the page title and `Server` header of devices with a web page (e.g. "ASUS RT-AX86U", "Synology DiskStation").
+   - **Windows networking**: a NetBIOS name query returns Windows PCs' and Samba NAS boxes' computer names and workgroups.
+   - **SSH**: the banner on port 22 names the server software and often the OS (e.g. Ubuntu, Raspbian).
+6. **Type** is a best guess from all of the above (Bonjour model and category and UPnP first, then services, open ports, maker, and web/SSH hints).
 
-A scan of a /24 takes about 10 seconds.
+A scan of a /24 takes about 10–15 seconds, including the identify pass.
 
 ## Build and install
 
@@ -57,4 +65,4 @@ The Network Scanner menu shows the version, build number and build time, e.g. *V
 
 ## Privacy
 
-Scans stay on your network. The only things fetched from the internet are `updates/latest.json` from this repo, and (unless you turn off **Look Up Device Makers**) the public maker list from wireshark.org, about once a month, cached in `~/Library/Application Support/NetworkScanner/`.
+Scans stay on your network: the identify pass only talks to addresses on your local network. The only things fetched from the internet are `updates/latest.json` from this repo, and (unless you turn off **Look Up Device Makers**) the public maker list from wireshark.org, about once a month, cached in `~/Library/Application Support/NetworkScanner/`.
