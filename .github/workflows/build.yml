@@ -1,6 +1,8 @@
 name: Build
+# Proves every branch and pull request builds. Pushes to main are built (and shipped) by release.yml.
 on:
   push:
+    branches-ignore: [main]
   pull_request:
 jobs:
   build:
@@ -13,7 +15,8 @@ jobs:
         run: UPDATE_NOTES="CI build" ./release.sh
       - name: Check the bundle
         run: |
-          lipo -info NetworkScanner.app/Contents/MacOS/NetworkScanner
+          unzip -q -o updates/NetworkScanner.zip -d "$RUNNER_TEMP/release"
+          lipo -info "$RUNNER_TEMP/release/NetworkScanner/NetworkScanner.app/Contents/MacOS/NetworkScanner"
           /usr/libexec/PlistBuddy -c 'Print' NetworkScanner.app/Contents/Info.plist
           unzip -l updates/NetworkScanner.zip
           python3 -c 'import json; print(json.load(open("updates/latest.json")))'

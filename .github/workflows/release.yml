@@ -1,0 +1,62 @@
+name: Release
+# Every push to main is built on a Mac. If Info.plist's version is newer than the one in
+# updates/latest.json, the new updates/NetworkScanner.zip + latest.json are committed back to
+# main, which ships it: installed copies read latest.json from main. Notes come from
+# RELEASE_NOTES.txt. Commits pushed with GITHUB_TOKEN don't trigger workflows, so no loop.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: release
+  cancel-in-progress: false
+jobs:
+  release:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Compare versions
+        id: version
+        run: |
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json, plistlib
+          new = plistlib.load(open("Info.plist", "rb"))["CFBundleShortVersionString"]
+          try:
+              old = json.load(open("updates/latest.json"))["version"]
+          except (OSError, ValueError, KeyError):
+              old = "0"
+          key = lambda v: [int(x) if x.isdigit() else 0 for x in v.split(".")]
+          a, b = key(new), key(old)
+          n = max(len(a), len(b))
+          newer = a + [0] * (n - len(a)) > b + [0] * (n - len(b))
+          print(f"version={new}")
+          print(f"published={old}")
+          print(f"ship={'true' if newer else 'false'}")
+          PY
+          cat "$GITHUB_OUTPUT"
+      - name: Universal release build (arm64 + x86_64)
+        run: ./release.sh
+      - name: Check the bundle
+        run: |
+          unzip -q -o updates/NetworkScanner.zip -d "$RUNNER_TEMP/release"
+          lipo -info "$RUNNER_TEMP/release/NetworkScanner/NetworkScanner.app/Contents/MacOS/NetworkScanner"
+          python3 -c 'import json; print(json.load(open("updates/latest.json")))'
+      - name: Ship it
+        if: steps.version.outputs.ship == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add updates/NetworkScanner.zip updates/latest.json
+          git commit -m "Release v${{ steps.version.outputs.version }}"
+          for i in 1 2 3; do
+            git pull --rebase origin main && git push origin HEAD:main && exit 0
+            sleep 5
+          done
+          exit 1
+      - name: Nothing to ship
+        if: steps.version.outputs.ship != 'true'
+        run: echo "Info.plist is v${{ steps.version.outputs.version }}, already published v${{ steps.version.outputs.published }}. Nothing shipped."
