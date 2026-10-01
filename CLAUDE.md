@@ -4,7 +4,8 @@ Regular macOS windowed app (AppKit + a SwiftUI table; not a menu bar app) that l
 Plain swiftc, no Xcode project, no dependencies, macOS 14+.
 
 - `NetworkScanner.swift`: app delegate, main menu, Dock badge, devices window, remembered devices.
-- `Scanner.swift`: interface/gateway discovery, TCP probes, ARP cache, reverse DNS, Bonjour, OUI makers.
+- `Scanner.swift`: interface/gateway discovery, TCP probes, ARP cache, reverse DNS, Bonjour (incl. TXT details), OUI makers, `Device` and its type guess.
+- `Identify.swift`: the identify pass after each scan (UPnP/SSDP, web titles, NetBIOS names, SSH banners) and Deep Scan.
 - `Updater.swift`: the shared self-update scheme (same as PasteStack and Curtain). Keep it in sync with those.
 
 ## Building
@@ -22,5 +23,6 @@ at launch and every 6 hours. `./build.sh` alone publishes nothing.
 ## Known traps
 
 - Ad-hoc signing: every rebuild voids privacy grants. install.sh and the updater run `tccutil reset All`.
+- Plain-HTTP requests to devices rely on `NSAllowsLocalNetworking` in Info.plist (ATS). Identify only fetches from IP addresses on the LAN.
 - macOS 15+ Local Network privacy: without it every probe fails, and the window shows a hint.
   New Bonjour types must also be added to `NSBonjourServices` in Info.plist.
