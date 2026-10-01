@@ -1,1 +1,1 @@
-{"version": "1.0", "url": "NetworkScanner.zip", "notes": "First release"}
+{"version": "1.1", "url": "NetworkScanner.zip", "notes": "See much more about each device. Select a device for a details pane showing everything it announces: UPnP name, maker, model and firmware; printer model and location; HomeKit category; Chromecast and AirPlay details; its web page title; Windows computer name; and SSH banner. New Model column, better device types (TV, NAS, Linux, Raspberry Pi), and Deep Scan to check about 1,100 ports on one device."}
