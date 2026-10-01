@@ -12,13 +12,16 @@ Plain swiftc, no Xcode project, no dependencies, macOS 14+.
 
 - `./build.sh` builds `NetworkScanner.app` (gitignored) for this Mac; `./install.sh` copies it to /Applications.
 - Build number = `git rev-list --count HEAD`, build time = UTC, both stamped into the bundle's Info.plist.
-- CI (`.github/workflows/build.yml`) runs `release.sh` on macOS, so every push proves the universal build compiles.
+- CI (`.github/workflows/build.yml`) runs `release.sh` on macOS for branches and PRs, so every change proves the universal build compiles.
 
 ## Releases
 
-Bump `CFBundleShortVersionString` in Info.plist, run `UPDATE_NOTES="…" ./release.sh`, then commit and push
-`updates/` to main. Installed copies read `updates/latest.json` from raw.githubusercontent.com (main branch)
-at launch and every 6 hours. `./build.sh` alone publishes nothing.
+Releases ship automatically: bump `CFBundleShortVersionString` in Info.plist and update `RELEASE_NOTES.txt` in the
+same PR. On every push to main, `.github/workflows/release.yml` builds on macOS and, if Info.plist's version is newer
+than `updates/latest.json`, commits `updates/NetworkScanner.zip` + `latest.json` to main as github-actions[bot].
+Never hand-edit `updates/`. Installed copies read `updates/latest.json` from raw.githubusercontent.com (main branch)
+at launch and every 6 hours. Manual fallback: `UPDATE_NOTES="…" ./release.sh`, then push `updates/`.
+`./build.sh` alone publishes nothing.
 
 ## Known traps
 
