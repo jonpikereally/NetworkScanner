@@ -45,12 +45,13 @@ macOS 15 and later ask for **Local Network** access the first time it scans. All
 
 Network Scanner checks `updates/latest.json` in this repo shortly after launch and every 6 hours. When a newer version exists, the Dock icon gets a ↑ badge, the window shows an **⬆︎ Update to vX…** button, and the Network Scanner menu shows **⬆︎ Install Update to vX…** in place of **Check for Updates…**. Installing shows the release notes and asks first, then downloads `updates/NetworkScanner.zip`, quits, swaps the app in place, resets its permissions and relaunches. **Update Source…** in the Network Scanner menu can point it at a different feed, such as a local file for testing.
 
-To ship a release:
+To ship a release, bump `CFBundleShortVersionString` in `Info.plist`, write what changed in `RELEASE_NOTES.txt`, and merge to `main`. The **Release** workflow (`.github/workflows/release.yml`) builds every push to `main` on a GitHub Mac runner. When `Info.plist`'s version is newer than the one in `updates/latest.json`, it commits the universal `updates/NetworkScanner.zip` and `updates/latest.json` back to `main`, which ships it. Pushes that don't bump the version ship nothing. You can also run it by hand from the Actions tab.
+
+To ship from your own Mac instead (the PasteStack/Curtain way):
 
 ```bash
-# 1. bump CFBundleShortVersionString in Info.plist
-UPDATE_NOTES="What changed" ./release.sh   # universal build → updates/NetworkScanner.zip + updates/latest.json
-# 2. commit and push to main, including updates/
+UPDATE_NOTES="What changed" ./release.sh   # or omit UPDATE_NOTES to use RELEASE_NOTES.txt
+# then commit and push updates/ to main
 ```
 
 `raw.githubusercontent.com` caches for about 5 minutes, so a fresh release can take a moment to show up. Update checks only work while the repo is public.
