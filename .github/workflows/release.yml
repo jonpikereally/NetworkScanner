@@ -38,7 +38,7 @@ jobs:
           print(f"ship={'true' if newer else 'false'}")
           PY
           cat "$GITHUB_OUTPUT"
-      - name: Universal release build (arm64 + x86_64)
+      - name: Release build (Apple silicon)
         run: ./release.sh
       - name: Check the bundle
         run: |

@@ -11,7 +11,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - name: Universal release build (arm64 + x86_64)
+      - name: Release build (Apple silicon)
         run: UPDATE_NOTES="CI build" ./release.sh
       - name: Check the bundle
         run: |

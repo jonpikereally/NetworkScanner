@@ -1,5 +1,5 @@
 #!/bin/zsh
-# Build a release: universal (Apple Silicon + Intel) app with an installer, written to
+# Build a release: Apple silicon app with an installer, written to
 # updates/NetworkScanner.zip + updates/latest.json. Committing and pushing updates/ ships it:
 # every installed copy's "Check for Updates" reads latest.json from this repo on GitHub.
 #
@@ -16,19 +16,16 @@ fi
 BUILD=$(git rev-list --count HEAD 2>/dev/null || echo 0)
 CACHE="${TMPDIR:-/tmp}/networkscanner-modcache"
 SOURCES=(NetworkScanner.swift Scanner.swift Identify.swift Catalog.swift Updater.swift)
-mkdir -p "$CACHE" "$CACHE-x86"
-echo "Building arm64…"
+mkdir -p "$CACHE"
+echo "Building (Apple silicon)…"
 swiftc -O -target arm64-apple-macos14 -module-cache-path "$CACHE" \
   -o "$CACHE/NetworkScanner-arm64" -parse-as-library $SOURCES
-echo "Building x86_64…"
-swiftc -O -target x86_64-apple-macos14 -module-cache-path "$CACHE-x86" \
-  -o "$CACHE/NetworkScanner-x86_64" -parse-as-library $SOURCES
 
 DIST="$CACHE/dist"
 rm -rf "$DIST"
 APP="$DIST/NetworkScanner/NetworkScanner.app"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
-lipo -create -output "$APP/Contents/MacOS/NetworkScanner" "$CACHE/NetworkScanner-arm64" "$CACHE/NetworkScanner-x86_64"
+cp "$CACHE/NetworkScanner-arm64" "$APP/Contents/MacOS/NetworkScanner"
 cp Info.plist "$APP/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $BUILD" -c "Add :BuildDate string $(date -u +%Y-%m-%dT%H:%M:%SZ)" "$APP/Contents/Info.plist"
 cp NetworkScanner.icns "$APP/Contents/Resources/"
